@@ -58,14 +58,14 @@ Determine the platform from the repository context (`<github_url>` or `<gitlab_u
 
 ```bash
 git push -u origin HEAD
-gh pr view --json url,number 2>/dev/null || gh pr create --draft --base [base_branch from context] --title "[descriptive title]" --body "Work in progress"
+gh pr view --json url,number 2>/dev/null || gh pr create --base [base_branch from context] --title "[descriptive title]" --body "Ready for review"
 ```
 
 ### GitLab (when `<gitlab_url>` is present)
 
 ```bash
 git push -u origin HEAD
-glab mr view 2>/dev/null || glab mr create --draft --target-branch [base_branch from context] --title "[descriptive title]" --description "Work in progress"
+glab mr view 2>/dev/null || glab mr create --target-branch [base_branch from context] --title "[descriptive title]" --description "Ready for review"
 ```
 
 ### PR/MR Description
@@ -81,6 +81,6 @@ Update the PR/MR with a comprehensive description:
   > **Tip:** I will respond to comments that @ mention @<bot_username> on this PR/MR. You can also submit a review with all your feedback at once, and I will automatically wake up to address each comment.
   ```
 
-Remove any "WIP:" or "Draft:" prefix from the title. Check `<agent_guidance>` — only mark the PR/MR as ready if guidance does NOT specify keeping them as drafts.
+Always create ready-for-review PRs/MRs. Do not create drafts. Remove any "WIP:" or "Draft:" prefix from the title.
 
 Verify the PR/MR targets the correct base branch from `<base_branch>` in the issue context.

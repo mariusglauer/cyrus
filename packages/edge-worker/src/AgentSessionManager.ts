@@ -1,4 +1,6 @@
+import { execFile } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { promisify } from "node:util";
 import type {
 	APIAssistantMessage,
 	APIUserMessage,
@@ -30,6 +32,9 @@ import type {
 	ActivitySignal,
 	IActivitySink,
 } from "./sinks/index.js";
+
+const execFileAsync = promisify(execFile);
+const AUTO_PR_MAX_BUFFER = 10 * 1024 * 1024;
 
 /**
  * Events emitted by AgentSessionManager
@@ -371,13 +376,21 @@ export class AgentSessionManager extends EventEmitter {
 			return;
 		}
 
+		const finalResultMessage =
+			status === AgentSessionStatus.Complete
+				? await this.ensurePullRequestForLinearCodeChanges(
+						sessionId,
+						resultMessage,
+					)
+				: resultMessage;
+
 		// Post final result to issue tracker
-		await this.addResultEntry(sessionId, resultMessage);
+		await this.addResultEntry(sessionId, finalResultMessage);
 
 		// Handle child session completion
 		const parentSessionId = this.getParentSessionId?.(sessionId);
 		if (parentSessionId && this.resumeParentSession) {
-			await this.handleChildSessionCompletion(sessionId, resultMessage);
+			await this.handleChildSessionCompletion(sessionId, finalResultMessage);
 		}
 
 		log.info(`Session completed (subtype: ${resultMessage.subtype})`);
@@ -394,6 +407,257 @@ export class AgentSessionManager extends EventEmitter {
 
 	requestSessionStop(linearAgentActivitySessionId: string): void {
 		this.stopRequestedSessions.add(linearAgentActivitySessionId);
+	}
+
+	private async ensurePullRequestForLinearCodeChanges(
+		sessionId: string,
+		resultMessage: SDKResultMessage,
+	): Promise<SDKResultMessage> {
+		const session = this.sessions.get(sessionId);
+		if (!session || session.issueContext?.trackerId !== "linear") {
+			return resultMessage;
+		}
+
+		const repository = session.repositories[0];
+		const repoDir = repository?.repositoryId
+			? (session.workspace.repoPaths?.[repository.repositoryId] ??
+				session.workspace.path)
+			: session.workspace.path;
+		const issueIdentifier =
+			session.issueContext?.issueIdentifier ?? session.issue?.identifier;
+
+		if (!repoDir || !issueIdentifier) {
+			return resultMessage;
+		}
+
+		try {
+			const gitStatus = await this.tryWorkspaceCommand(repoDir, "git", [
+				"status",
+				"--porcelain",
+			]);
+			if (!gitStatus) {
+				return resultMessage;
+			}
+
+			if (gitStatus.stdout.trim()) {
+				await this.runWorkspaceCommand(repoDir, "git", ["add", "-A"]);
+				const stagedStatus = await this.runWorkspaceCommand(repoDir, "git", [
+					"diff",
+					"--cached",
+					"--name-only",
+				]);
+				if (stagedStatus.stdout.trim()) {
+					await this.runWorkspaceCommand(repoDir, "git", [
+						"commit",
+						"-m",
+						this.buildAutoCommitMessage(session),
+					]);
+				}
+			}
+
+			const currentBranch = (
+				await this.runWorkspaceCommand(repoDir, "git", [
+					"branch",
+					"--show-current",
+				])
+			).stdout.trim();
+			if (!currentBranch) {
+				return resultMessage;
+			}
+
+			const baseBranch = this.getSessionBaseBranch(session);
+			if (currentBranch === baseBranch) {
+				return resultMessage;
+			}
+
+			const baseRef = (await this.tryWorkspaceCommand(repoDir, "git", [
+				"rev-parse",
+				"--verify",
+				baseBranch,
+			]))
+				? baseBranch
+				: `origin/${baseBranch}`;
+			const aheadCount = (
+				await this.runWorkspaceCommand(repoDir, "git", [
+					"rev-list",
+					"--count",
+					`${baseRef}..${currentBranch}`,
+				])
+			).stdout.trim();
+			if (aheadCount === "0") {
+				return resultMessage;
+			}
+
+			await this.runWorkspaceCommand(repoDir, "git", [
+				"push",
+				"-u",
+				"origin",
+				currentBranch,
+			]);
+
+			const existingPrUrl = await this.findExistingPullRequestUrl(
+				repoDir,
+				currentBranch,
+			);
+			const pullRequestUrl =
+				existingPrUrl ??
+				(await this.createPullRequest(
+					repoDir,
+					currentBranch,
+					baseBranch,
+					session,
+					resultMessage,
+				));
+
+			return this.appendResultNote(resultMessage, pullRequestUrl);
+		} catch (error) {
+			this.sessionLog(sessionId).error(
+				`Failed to create or update pull request:`,
+				error,
+			);
+			return resultMessage;
+		}
+	}
+
+	private buildAutoCommitMessage(session: CyrusAgentSession): string {
+		const issueIdentifier =
+			session.issueContext?.issueIdentifier ?? session.issue?.identifier;
+		const title = this.cleanPullRequestTitle(
+			session.issue?.title ?? "Linear task changes",
+		);
+		return `fix: ${issueIdentifier ? `${issueIdentifier} ` : ""}${title}`;
+	}
+
+	private getSessionBaseBranch(session: CyrusAgentSession): string {
+		const repository = session.repositories[0];
+		if (repository?.baseBranchName) {
+			return repository.baseBranchName;
+		}
+
+		if (repository?.repositoryId) {
+			const resolved =
+				session.workspace.resolvedBaseBranches?.[repository.repositoryId];
+			if (resolved?.branch) {
+				return resolved.branch;
+			}
+		}
+
+		return "main";
+	}
+
+	private async findExistingPullRequestUrl(
+		repoDir: string,
+		branch: string,
+	): Promise<string | undefined> {
+		const result = await this.tryWorkspaceCommand(repoDir, "gh", [
+			"pr",
+			"list",
+			"--head",
+			branch,
+			"--state",
+			"open",
+			"--json",
+			"url,isDraft",
+		]);
+		if (!result) {
+			return undefined;
+		}
+
+		const pullRequests = JSON.parse(result.stdout || "[]") as Array<{
+			url?: string;
+			isDraft?: boolean;
+		}>;
+		const pullRequest = pullRequests[0];
+		if (!pullRequest?.url) {
+			return undefined;
+		}
+
+		if (pullRequest.isDraft) {
+			await this.tryWorkspaceCommand(repoDir, "gh", [
+				"pr",
+				"ready",
+				pullRequest.url,
+			]);
+		}
+
+		return pullRequest.url;
+	}
+
+	private async createPullRequest(
+		repoDir: string,
+		branch: string,
+		baseBranch: string,
+		session: CyrusAgentSession,
+		resultMessage: SDKResultMessage,
+	): Promise<string> {
+		const issueIdentifier =
+			session.issueContext?.issueIdentifier ?? session.issue?.identifier;
+		const title = `${issueIdentifier}: ${this.cleanPullRequestTitle(
+			session.issue?.title ?? "Cyrus changes",
+		)}`;
+		const body =
+			"result" in resultMessage && typeof resultMessage.result === "string"
+				? resultMessage.result
+				: `Automated changes for ${issueIdentifier}.`;
+		const result = await this.runWorkspaceCommand(repoDir, "gh", [
+			"pr",
+			"create",
+			"--base",
+			baseBranch,
+			"--head",
+			branch,
+			"--title",
+			title,
+			"--body",
+			body,
+		]);
+
+		return result.stdout.trim();
+	}
+
+	private cleanPullRequestTitle(title: string): string {
+		return title.replace(/^(wip|draft):\s*/i, "").trim() || "Cyrus changes";
+	}
+
+	private appendResultNote(
+		resultMessage: SDKResultMessage,
+		pullRequestUrl: string,
+	): SDKResultMessage {
+		if (
+			!("result" in resultMessage) ||
+			typeof resultMessage.result !== "string" ||
+			resultMessage.result.includes(pullRequestUrl)
+		) {
+			return resultMessage;
+		}
+
+		return {
+			...resultMessage,
+			result: `${resultMessage.result.trim()}\n\nPull request: ${pullRequestUrl}`,
+		} as SDKResultMessage;
+	}
+
+	private async runWorkspaceCommand(
+		cwd: string,
+		command: string,
+		args: string[],
+	): Promise<{ stdout: string; stderr: string }> {
+		return await execFileAsync(command, args, {
+			cwd,
+			maxBuffer: AUTO_PR_MAX_BUFFER,
+		});
+	}
+
+	private async tryWorkspaceCommand(
+		cwd: string,
+		command: string,
+		args: string[],
+	): Promise<{ stdout: string; stderr: string } | undefined> {
+		try {
+			return await this.runWorkspaceCommand(cwd, command, args);
+		} catch {
+			return undefined;
+		}
 	}
 
 	/**
@@ -1200,6 +1464,21 @@ export class AgentSessionManager extends EventEmitter {
 				log.debug(
 					`Skipping activity sync - no external session ID (platform: ${session.issueContext?.trackerId || "unknown"})`,
 				);
+				return;
+			}
+
+			if (ephemeral && process.env.CYRUS_LINEAR_STREAM_ACTIONS !== "true") {
+				return;
+			}
+
+			const activityToolName = entry.metadata?.toolName || "";
+			if (
+				activityToolName &&
+				process.env.CYRUS_LINEAR_STREAM_TASKS !== "true" &&
+				/^(↪ )?(TaskCreate|TaskUpdate|TaskGet|TaskList|TodoWrite|write_todos)$/.test(
+					activityToolName,
+				)
+			) {
 				return;
 			}
 
