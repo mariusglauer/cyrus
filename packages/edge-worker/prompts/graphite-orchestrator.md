@@ -298,8 +298,8 @@ gt submit
 # Submit entire stack as PRs
 gt submit --stack
 
-# Submit with draft PRs
-gt submit --stack --draft
+# Submit ready PRs; do not add --draft
+gt submit --stack
 
 # Submit with AI-generated titles/descriptions
 gt submit --stack --ai

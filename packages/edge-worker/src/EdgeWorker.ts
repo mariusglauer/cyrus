@@ -2,7 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { execSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { LinearClient } from "@linear/sdk";
 import type {
@@ -196,6 +196,26 @@ type CyrusToolsMcpContext = {
 	contextId?: string;
 };
 
+type RateLimitHeaders =
+	| Record<string, string | number | undefined>
+	| { get(name: string): string | null };
+
+type LinearSessionQueueItem = {
+	webhook: AgentSessionCreatedWebhook;
+	repoIds: string[];
+	issueIdentifier: string;
+	sessionId: string;
+	queuedAt: number;
+	availableAt: number;
+	retryCount: number;
+	lastError?: string;
+	startedAt?: number;
+};
+
+type SerializedLinearSessionQueueItem = LinearSessionQueueItem & {
+	state?: "queued" | "running";
+};
+
 /**
  * Unified edge worker that **orchestrates**
  *   capturing Linear webhooks,
@@ -231,6 +251,39 @@ export class EdgeWorker extends EventEmitter {
 	public repositoryRouter: RepositoryRouter; // Repository routing and selection
 	private gitService: GitService;
 	private activeWebhookCount = 0; // Track number of webhooks currently being processed
+	private linearSessionQueue: LinearSessionQueueItem[] = [];
+	private linearSessionActiveItems: Map<string, LinearSessionQueueItem> =
+		new Map();
+	private linearSessionQueueFile: string;
+	private linearSessionQueueDrainTimer: NodeJS.Timeout | null = null;
+	private linearSessionCooldownUntil = 0;
+	private readonly linearSessionQueueConcurrency = Math.max(
+		1,
+		Number.parseInt(process.env.CYRUS_LINEAR_CONCURRENCY || "2", 10) || 2,
+	);
+	private readonly linearSessionMaxRetries = Math.max(
+		0,
+		Number.parseInt(process.env.CYRUS_LINEAR_MAX_RETRIES || "2", 10) || 2,
+	);
+	private readonly linearSessionRetryDelayMs = Math.max(
+		1_000,
+		Number.parseInt(process.env.CYRUS_LINEAR_RETRY_DELAY_MS || "300000", 10) ||
+			300_000,
+	);
+	private readonly linearSessionTimeoutMs = Math.max(
+		60_000,
+		Number.parseInt(
+			process.env.CYRUS_LINEAR_SESSION_TIMEOUT_MS || "5400000",
+			10,
+		) || 5_400_000,
+	);
+	private readonly linearRateLimitFallbackMs = Math.max(
+		60_000,
+		Number.parseInt(
+			process.env.CYRUS_LINEAR_RATE_LIMIT_COOLDOWN_MS || "3900000",
+			10,
+		) || 3_900_000,
+	);
 	/** Handler for AskUserQuestion tool invocations via Linear select signal */
 	private askUserQuestionHandler: AskUserQuestionHandler;
 	/** User access control for whitelisting/blacklisting Linear users */
@@ -321,6 +374,10 @@ export class EdgeWorker extends EventEmitter {
 		super();
 		this.config = EdgeWorker.normalizeConfigPaths(config);
 		this.cyrusHome = config.cyrusHome;
+		this.linearSessionQueueFile = join(
+			this.cyrusHome,
+			"linear-session-queue.json",
+		);
 		this.logger = createLogger({ component: "EdgeWorker" });
 		this.persistenceManager = new PersistenceManager(
 			join(this.cyrusHome, "state"),
@@ -707,6 +764,9 @@ export class EdgeWorker extends EventEmitter {
 
 		// Start shared application server (this also starts Cloudflare tunnel if CLOUDFLARE_TOKEN is set)
 		await this.sharedApplicationServer.start();
+
+		await this.loadLinearSessionQueue();
+		this.drainLinearSessionQueue();
 	}
 
 	/**
@@ -2500,6 +2560,13 @@ ${taskSection}`;
 			return "busy";
 		}
 
+		if (
+			this.linearSessionActiveItems.size > 0 ||
+			this.linearSessionQueue.length > 0
+		) {
+			return "busy";
+		}
+
 		// Busy if any runner is actively running
 		const runners = this.agentSessionManager.getAllAgentRunners();
 		for (const runner of runners) {
@@ -3189,7 +3256,7 @@ ${taskSection}`;
 				// Keep unassigned webhook active
 				await this.handleIssueUnassignedWebhook(webhook);
 			} else if (isAgentSessionCreatedWebhook(webhook)) {
-				await this.handleAgentSessionCreatedWebhook(webhook, repos);
+				await this.enqueueLinearAgentSession(webhook, repos);
 			} else if (isAgentSessionPromptedWebhook(webhook)) {
 				await this.handleUserPromptedAgentActivity(webhook);
 			} else if (isIssueStateChangeWebhook(webhook)) {
@@ -3444,6 +3511,10 @@ ${taskSection}`;
 		}
 
 		const issueId = webhook.notification.issue.id;
+		await this.removeLinearQueueItemsForIssue(
+			issueId,
+			webhook.notification.issue.identifier,
+		);
 
 		// Get cached repository, with fallback to searching sessions
 		let repository = this.getCachedRepository(issueId);
@@ -4223,6 +4294,467 @@ ${taskSection}`;
 			allowedTools,
 			disallowedTools,
 		};
+	}
+
+	private async enqueueLinearAgentSession(
+		webhook: AgentSessionCreatedWebhook,
+		repos: RepositoryConfig[],
+	): Promise<void> {
+		const sessionId = webhook.agentSession?.id;
+		const issueIdentifier =
+			webhook.agentSession?.issue?.identifier || "unknown issue";
+
+		if (!sessionId) {
+			await this.handleAgentSessionCreatedWebhook(webhook, repos);
+			return;
+		}
+
+		if (
+			this.linearSessionActiveItems.has(sessionId) ||
+			this.linearSessionQueue.some((item) => item.sessionId === sessionId)
+		) {
+			this.logger.info(
+				`Skipping duplicate Linear agent session queue item for ${issueIdentifier}`,
+			);
+			return;
+		}
+
+		const now = Date.now();
+		const item: LinearSessionQueueItem = {
+			webhook,
+			repoIds: repos.map((repo) => repo.id),
+			issueIdentifier,
+			sessionId,
+			queuedAt: now,
+			availableAt: now,
+			retryCount: 0,
+		};
+
+		this.linearSessionQueue.push(item);
+		await this.saveLinearSessionQueue();
+
+		if (
+			this.linearSessionActiveItems.size >=
+				this.linearSessionQueueConcurrency ||
+			this.linearSessionCooldownUntil > now ||
+			this.linearSessionQueue.length > 1
+		) {
+			await this.postLinearQueueAcknowledgment(item, "queued");
+		}
+
+		this.drainLinearSessionQueue();
+	}
+
+	private drainLinearSessionQueue(): void {
+		if (this.linearSessionQueueDrainTimer) {
+			clearTimeout(this.linearSessionQueueDrainTimer);
+			this.linearSessionQueueDrainTimer = null;
+		}
+
+		const now = Date.now();
+		if (this.linearSessionCooldownUntil > now) {
+			this.scheduleLinearSessionQueueDrain(
+				this.linearSessionCooldownUntil - now,
+			);
+			return;
+		}
+
+		while (
+			this.linearSessionActiveItems.size < this.linearSessionQueueConcurrency
+		) {
+			const nextIndex = this.linearSessionQueue.findIndex(
+				(item) => item.availableAt <= now,
+			);
+
+			if (nextIndex === -1) {
+				const nextAvailableAt = this.linearSessionQueue.reduce(
+					(min, item) => Math.min(min, item.availableAt),
+					Number.POSITIVE_INFINITY,
+				);
+				if (Number.isFinite(nextAvailableAt)) {
+					this.scheduleLinearSessionQueueDrain(nextAvailableAt - now);
+				}
+				return;
+			}
+
+			const item = this.linearSessionQueue.splice(nextIndex, 1)[0]!;
+			item.startedAt = Date.now();
+			this.linearSessionActiveItems.set(item.sessionId, item);
+			void this.saveLinearSessionQueue();
+			void this.processLinearSessionQueueItem(item);
+		}
+	}
+
+	private scheduleLinearSessionQueueDrain(delayMs: number): void {
+		const boundedDelayMs = Math.max(1_000, delayMs);
+		this.linearSessionQueueDrainTimer = setTimeout(() => {
+			this.linearSessionQueueDrainTimer = null;
+			this.drainLinearSessionQueue();
+		}, boundedDelayMs);
+	}
+
+	private async processLinearSessionQueueItem(
+		item: LinearSessionQueueItem,
+	): Promise<void> {
+		try {
+			await this.postLinearQueueAcknowledgment(item, "starting");
+			await this.runLinearSessionQueueItemWithWatchdog(item);
+		} catch (error) {
+			const isRateLimited = this.applyLinearRateLimitCooldown(error);
+			await this.requeueOrFailLinearSessionItem(item, error, isRateLimited);
+		} finally {
+			this.linearSessionActiveItems.delete(item.sessionId);
+			await this.saveLinearSessionQueue();
+			this.drainLinearSessionQueue();
+		}
+	}
+
+	private async runLinearSessionQueueItemWithWatchdog(
+		item: LinearSessionQueueItem,
+	): Promise<void> {
+		let timeout: NodeJS.Timeout | undefined;
+		const timeoutPromise = new Promise<never>((_resolve, reject) => {
+			timeout = setTimeout(() => {
+				const error = new Error(
+					`Linear agent session ${item.issueIdentifier} timed out after ${Math.round(
+						this.linearSessionTimeoutMs / 60_000,
+					)} minutes`,
+				) as Error & { code?: string };
+				error.code = "CYRUS_LINEAR_SESSION_TIMEOUT";
+				reject(error);
+			}, this.linearSessionTimeoutMs);
+		});
+
+		try {
+			await Promise.race([
+				this.handleAgentSessionCreatedWebhook(
+					item.webhook,
+					this.resolveLinearSessionQueueRepos(item),
+				),
+				timeoutPromise,
+			]);
+		} catch (error) {
+			this.stopLinearSessionQueueItem(item);
+			throw error;
+		} finally {
+			if (timeout) {
+				clearTimeout(timeout);
+			}
+		}
+	}
+
+	private resolveLinearSessionQueueRepos(
+		item: LinearSessionQueueItem,
+	): RepositoryConfig[] {
+		const repos = item.repoIds
+			.map((repoId) => this.repositories.get(repoId))
+			.filter((repo): repo is RepositoryConfig => Boolean(repo));
+
+		if (repos.length > 0) {
+			return repos;
+		}
+
+		const fallbackRepos = Array.from(this.repositories.values()).filter(
+			(repo) => repo.isActive !== false,
+		);
+		if (fallbackRepos.length === 0) {
+			throw new Error(
+				`No active repositories available for ${item.issueIdentifier}`,
+			);
+		}
+
+		return fallbackRepos;
+	}
+
+	private stopLinearSessionQueueItem(item: LinearSessionQueueItem): void {
+		const session = this.agentSessionManager.getSession(item.sessionId);
+		if (!session) {
+			return;
+		}
+
+		this.agentSessionManager.requestSessionStop(item.sessionId);
+		session.agentRunner?.stop();
+	}
+
+	private async requeueOrFailLinearSessionItem(
+		item: LinearSessionQueueItem,
+		error: unknown,
+		isRateLimited: boolean,
+	): Promise<void> {
+		const nextRetryCount = item.retryCount + 1;
+		const errorMessage = this.formatLinearQueueError(error);
+
+		if (nextRetryCount > this.linearSessionMaxRetries) {
+			this.logger.error(
+				`Linear agent session ${item.issueIdentifier} failed after ${item.retryCount} retries: ${errorMessage}`,
+			);
+			if (!isRateLimited) {
+				await this.postLinearQueueFailure(item, errorMessage);
+			}
+			return;
+		}
+
+		const delayMs = isRateLimited
+			? Math.max(
+					this.linearSessionCooldownUntil - Date.now(),
+					this.linearSessionRetryDelayMs,
+				)
+			: this.linearSessionRetryDelayMs * nextRetryCount;
+
+		this.linearSessionQueue.push({
+			...item,
+			retryCount: nextRetryCount,
+			availableAt: Date.now() + delayMs,
+			lastError: errorMessage,
+			startedAt: undefined,
+		});
+
+		this.logger.warn(
+			`Re-queued ${item.issueIdentifier} after failure (retry ${nextRetryCount}/${this.linearSessionMaxRetries})`,
+		);
+	}
+
+	private async postLinearQueueAcknowledgment(
+		item: LinearSessionQueueItem,
+		state: "queued" | "starting",
+	): Promise<void> {
+		try {
+			const waitingCount = this.linearSessionQueue.length;
+			const body =
+				state === "starting"
+					? `Starting ${item.issueIdentifier}.`
+					: `Queued ${item.issueIdentifier}. Cyrus is already running ${this.linearSessionActiveItems.size} task(s); ${waitingCount} task(s) are waiting.`;
+
+			await this.activityPoster.postThoughtActivity(
+				item.sessionId,
+				item.webhook.organizationId,
+				body,
+			);
+		} catch (error) {
+			this.applyLinearRateLimitCooldown(error);
+			this.logger.warn(
+				`Failed to post Linear queue acknowledgment for ${item.issueIdentifier}: ${this.formatLinearQueueError(error)}`,
+			);
+		}
+	}
+
+	private async postLinearQueueFailure(
+		item: LinearSessionQueueItem,
+		errorMessage: string,
+	): Promise<void> {
+		try {
+			await this.activityPoster.postThoughtActivity(
+				item.sessionId,
+				item.webhook.organizationId,
+				`Cyrus could not start ${item.issueIdentifier} after ${this.linearSessionMaxRetries + 1} attempt(s). Last error: ${errorMessage}`,
+			);
+		} catch (error) {
+			this.applyLinearRateLimitCooldown(error);
+			this.logger.warn(
+				`Failed to post Linear queue failure for ${item.issueIdentifier}: ${this.formatLinearQueueError(error)}`,
+			);
+		}
+	}
+
+	private applyLinearRateLimitCooldown(error: unknown): boolean {
+		if (!this.isLinearRateLimitError(error)) {
+			return false;
+		}
+
+		const cooldownUntil = this.getLinearRateLimitResetMs(error);
+		this.linearSessionCooldownUntil = Math.max(
+			this.linearSessionCooldownUntil,
+			cooldownUntil,
+		);
+		this.logger.warn(
+			`Linear rate limit detected; pausing Linear queue until ${new Date(
+				this.linearSessionCooldownUntil,
+			).toISOString()}`,
+		);
+		return true;
+	}
+
+	private isLinearRateLimitError(error: unknown): boolean {
+		const candidate = error as {
+			status?: number;
+			statusCode?: number;
+			code?: string | number;
+			type?: string;
+			response?: { status?: number };
+			message?: string;
+		};
+		const status =
+			candidate.status ??
+			candidate.statusCode ??
+			candidate.response?.status ??
+			candidate.code;
+
+		if (status === 429 || status === "429") {
+			return true;
+		}
+
+		const text = `${candidate.type ?? ""} ${candidate.message ?? ""} ${
+			candidate.code ?? ""
+		}`;
+		return /rate.?limit|too many requests|429/i.test(text);
+	}
+
+	private getLinearRateLimitResetMs(error: unknown): number {
+		const candidate = error as {
+			headers?: RateLimitHeaders;
+			response?: {
+				headers?: RateLimitHeaders;
+			};
+		};
+		const headers = candidate.response?.headers ?? candidate.headers;
+		const retryAfter = this.getHeaderValue(headers, "retry-after");
+		if (retryAfter) {
+			const retryAfterSeconds = Number(retryAfter);
+			if (Number.isFinite(retryAfterSeconds)) {
+				return Date.now() + retryAfterSeconds * 1_000 + 5_000;
+			}
+		}
+
+		const resetHeader =
+			this.getHeaderValue(headers, "x-ratelimit-reset") ??
+			this.getHeaderValue(headers, "x-rate-limit-reset");
+		if (resetHeader) {
+			const numericReset = Number(resetHeader);
+			if (Number.isFinite(numericReset)) {
+				return numericReset < 10_000_000_000
+					? numericReset * 1_000 + 5_000
+					: numericReset + 5_000;
+			}
+
+			const dateReset = Date.parse(resetHeader);
+			if (Number.isFinite(dateReset)) {
+				return dateReset + 5_000;
+			}
+		}
+
+		return Date.now() + this.linearRateLimitFallbackMs;
+	}
+
+	private getHeaderValue(
+		headers: RateLimitHeaders | undefined,
+		name: string,
+	): string | undefined {
+		if (!headers) {
+			return undefined;
+		}
+
+		if ("get" in headers && typeof headers.get === "function") {
+			return headers.get(name) ?? undefined;
+		}
+
+		const lowerName = name.toLowerCase();
+		const record = headers as Record<string, string | number | undefined>;
+		const value =
+			record[name] ??
+			record[lowerName] ??
+			record[lowerName.replaceAll("-", "_")];
+		return value === undefined ? undefined : String(value);
+	}
+
+	private formatLinearQueueError(error: unknown): string {
+		if (error instanceof Error) {
+			return error.message;
+		}
+		return String(error);
+	}
+
+	private async loadLinearSessionQueue(): Promise<void> {
+		if (!existsSync(this.linearSessionQueueFile)) {
+			return;
+		}
+
+		try {
+			const rawQueue = await readFile(this.linearSessionQueueFile, "utf8");
+			const parsed = JSON.parse(rawQueue) as
+				| SerializedLinearSessionQueueItem[]
+				| { items?: SerializedLinearSessionQueueItem[] };
+			const items = Array.isArray(parsed) ? parsed : parsed.items || [];
+			const now = Date.now();
+
+			this.linearSessionQueue = items
+				.filter((item) => item?.sessionId && item?.webhook)
+				.map((item) => ({
+					...item,
+					repoIds: Array.isArray(item.repoIds) ? item.repoIds : [],
+					retryCount:
+						item.state === "running" ? item.retryCount + 1 : item.retryCount,
+					availableAt:
+						item.state === "running"
+							? now + this.linearSessionRetryDelayMs
+							: item.availableAt || now,
+					startedAt: undefined,
+				}));
+
+			if (this.linearSessionQueue.length > 0) {
+				this.logger.info(
+					`Loaded ${this.linearSessionQueue.length} Linear queue item(s) from disk`,
+				);
+			}
+		} catch (error) {
+			this.logger.error(
+				`Failed to load Linear session queue from ${this.linearSessionQueueFile}`,
+				error,
+			);
+			this.linearSessionQueue = [];
+		}
+	}
+
+	private async saveLinearSessionQueue(): Promise<void> {
+		const items: SerializedLinearSessionQueueItem[] = [
+			...Array.from(this.linearSessionActiveItems.values()).map((item) => ({
+				...item,
+				state: "running" as const,
+			})),
+			...this.linearSessionQueue.map((item) => ({
+				...item,
+				state: "queued" as const,
+			})),
+		];
+
+		await mkdir(this.cyrusHome, { recursive: true });
+		const tempPath = `${this.linearSessionQueueFile}.tmp`;
+		await writeFile(
+			tempPath,
+			JSON.stringify(
+				{
+					version: 1,
+					items,
+				},
+				null,
+				2,
+			),
+		);
+		await rename(tempPath, this.linearSessionQueueFile);
+	}
+
+	private async removeLinearQueueItemsForIssue(
+		issueId: string,
+		issueIdentifier?: string,
+	): Promise<void> {
+		const beforeCount = this.linearSessionQueue.length;
+		this.linearSessionQueue = this.linearSessionQueue.filter(
+			(item) =>
+				item.webhook.agentSession?.issue?.id !== issueId &&
+				item.webhook.agentSession?.issue?.identifier !== issueIdentifier,
+		);
+
+		for (const item of this.linearSessionActiveItems.values()) {
+			if (
+				item.webhook.agentSession?.issue?.id === issueId ||
+				item.webhook.agentSession?.issue?.identifier === issueIdentifier
+			) {
+				this.stopLinearSessionQueueItem(item);
+			}
+		}
+
+		if (beforeCount !== this.linearSessionQueue.length) {
+			await this.saveLinearSessionQueue();
+		}
 	}
 
 	/**
