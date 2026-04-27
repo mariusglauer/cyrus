@@ -341,7 +341,17 @@ describe("EdgeWorker - Status Endpoint", () => {
 			await capturedHandler({}, mockReply);
 
 			expect(mockReply.status).toHaveBeenCalledWith(200);
-			expect(mockReply.send).toHaveBeenCalledWith({ status: "idle" });
+			expect(mockReply.send).toHaveBeenCalledWith(
+				expect.objectContaining({
+					status: "idle",
+					activeWebhookCount: 0,
+					activeRunnerCount: 0,
+					linearQueue: expect.objectContaining({
+						pending: 0,
+						active: 0,
+					}),
+				}),
+			);
 		});
 
 		it("should return busy status via the endpoint handler when webhook is processing", async () => {
@@ -388,7 +398,16 @@ describe("EdgeWorker - Status Endpoint", () => {
 			await capturedHandler({}, mockReply);
 
 			expect(mockReply.status).toHaveBeenCalledWith(200);
-			expect(mockReply.send).toHaveBeenCalledWith({ status: "busy" });
+			expect(mockReply.send).toHaveBeenCalledWith(
+				expect.objectContaining({
+					status: "busy",
+					activeWebhookCount: 1,
+					linearQueue: expect.objectContaining({
+						pending: 0,
+						active: 0,
+					}),
+				}),
+			);
 		});
 	});
 });

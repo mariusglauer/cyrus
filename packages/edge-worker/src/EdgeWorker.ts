@@ -913,11 +913,29 @@ export class EdgeWorker extends EventEmitter {
 
 		// 3. Register MCP endpoint for cyrus-tools on the same Fastify server/port
 		await this.registerCyrusToolsMcpEndpoint();
-		// 4. Register /status endpoint for process activity monitoring
+		// 4. Register dashboard and status endpoints for process activity monitoring
+		this.registerDashboardEndpoint();
 		this.registerStatusEndpoint();
 
 		// 5. Register /version endpoint for CLI version info
 		this.registerVersionEndpoint();
+	}
+
+	/**
+	 * Register the root dashboard for quick operational visibility.
+	 */
+	private registerDashboardEndpoint(): void {
+		const fastify = this.sharedApplicationServer.getFastifyInstance();
+
+		fastify.get("/", async (_request, reply) => {
+			return reply
+				.status(200)
+				.header("content-type", "text/html; charset=utf-8")
+				.send(this.renderDashboardHtml());
+		});
+
+		this.logger.info("✅ Dashboard endpoint registered");
+		this.logger.info("   Route: GET /");
 	}
 
 	/**
@@ -928,12 +946,419 @@ export class EdgeWorker extends EventEmitter {
 		const fastify = this.sharedApplicationServer.getFastifyInstance();
 
 		fastify.get("/status", async (_request, reply) => {
-			const status = this.computeStatus();
-			return reply.status(200).send({ status });
+			return reply.status(200).send(this.buildStatusPayload());
+		});
+
+		fastify.get("/linear-queue", async (_request, reply) => {
+			return reply.status(200).send(this.buildLinearQueueStatus());
 		});
 
 		this.logger.info("✅ Status endpoint registered");
 		this.logger.info("   Route: GET /status");
+		this.logger.info("   Route: GET /linear-queue");
+	}
+
+	private renderDashboardHtml(): string {
+		return `<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Cyrus Dashboard</title>
+	<style>
+		:root {
+			color-scheme: light dark;
+			--bg: #f7f8fa;
+			--panel: #ffffff;
+			--panel-soft: #f1f4f7;
+			--text: #171a1f;
+			--muted: #667085;
+			--line: #d8dee8;
+			--accent: #126a5a;
+			--danger: #b42318;
+			--warning: #b54708;
+			--shadow: 0 1px 2px rgb(16 24 40 / 8%);
+		}
+
+		@media (prefers-color-scheme: dark) {
+			:root {
+				--bg: #101214;
+				--panel: #181b1f;
+				--panel-soft: #20242a;
+				--text: #eef1f5;
+				--muted: #aab3c1;
+				--line: #313842;
+				--accent: #4bc7ac;
+				--danger: #ff8a80;
+				--warning: #ffbc6e;
+				--shadow: none;
+			}
+		}
+
+		* { box-sizing: border-box; }
+
+		body {
+			margin: 0;
+			background: var(--bg);
+			color: var(--text);
+			font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+		}
+
+		main {
+			width: min(1200px, calc(100vw - 32px));
+			margin: 0 auto;
+			padding: 28px 0 40px;
+		}
+
+		header {
+			display: flex;
+			align-items: flex-start;
+			justify-content: space-between;
+			gap: 20px;
+			margin-bottom: 22px;
+		}
+
+		h1 {
+			margin: 0;
+			font-size: 28px;
+			line-height: 1.15;
+			letter-spacing: 0;
+		}
+
+		h2 {
+			margin: 0 0 12px;
+			font-size: 16px;
+			line-height: 1.25;
+			letter-spacing: 0;
+		}
+
+		.muted { color: var(--muted); }
+
+		.status-pill {
+			display: inline-flex;
+			align-items: center;
+			gap: 8px;
+			min-height: 32px;
+			padding: 4px 10px;
+			border: 1px solid var(--line);
+			border-radius: 8px;
+			background: var(--panel);
+			box-shadow: var(--shadow);
+			font-weight: 600;
+		}
+
+		.dot {
+			width: 9px;
+			height: 9px;
+			border-radius: 999px;
+			background: var(--accent);
+		}
+
+		.status-pill.busy .dot { background: var(--warning); }
+		.status-pill.error .dot { background: var(--danger); }
+
+		.metrics {
+			display: grid;
+			grid-template-columns: repeat(5, minmax(0, 1fr));
+			gap: 12px;
+			margin-bottom: 18px;
+		}
+
+		.metric,
+		.section {
+			border: 1px solid var(--line);
+			border-radius: 8px;
+			background: var(--panel);
+			box-shadow: var(--shadow);
+		}
+
+		.metric { padding: 14px; }
+
+		.metric-label {
+			margin-bottom: 6px;
+			color: var(--muted);
+			font-size: 12px;
+			text-transform: uppercase;
+		}
+
+		.metric-value {
+			font-size: 24px;
+			line-height: 1.2;
+			font-weight: 700;
+			letter-spacing: 0;
+		}
+
+		.section {
+			margin-top: 14px;
+			padding: 16px;
+			overflow: hidden;
+		}
+
+		.table-wrap { overflow-x: auto; }
+
+		table {
+			width: 100%;
+			border-collapse: collapse;
+			min-width: 720px;
+		}
+
+		th,
+		td {
+			padding: 10px 8px;
+			border-bottom: 1px solid var(--line);
+			text-align: left;
+			vertical-align: top;
+		}
+
+		th {
+			color: var(--muted);
+			font-size: 12px;
+			font-weight: 600;
+			text-transform: uppercase;
+		}
+
+		tbody tr:last-child td { border-bottom: 0; }
+
+		code {
+			padding: 2px 5px;
+			border-radius: 4px;
+			background: var(--panel-soft);
+			font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+			font-size: 12px;
+		}
+
+		.empty {
+			padding: 18px 0;
+			color: var(--muted);
+		}
+
+		.config {
+			display: flex;
+			flex-wrap: wrap;
+			gap: 8px;
+			margin-top: 8px;
+		}
+
+		.config span {
+			display: inline-flex;
+			align-items: center;
+			min-height: 28px;
+			padding: 3px 8px;
+			border: 1px solid var(--line);
+			border-radius: 6px;
+			background: var(--panel-soft);
+			color: var(--muted);
+		}
+
+		.error-text { color: var(--danger); }
+
+		@media (max-width: 900px) {
+			.metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+			header { flex-direction: column; }
+		}
+
+		@media (max-width: 520px) {
+			main {
+				width: min(100vw - 20px, 1200px);
+				padding-top: 18px;
+			}
+			.metrics { grid-template-columns: 1fr; }
+			h1 { font-size: 24px; }
+		}
+	</style>
+</head>
+<body>
+	<main>
+		<header>
+			<div>
+				<h1>Cyrus Dashboard</h1>
+				<div class="muted" id="updated">Loading...</div>
+			</div>
+			<div class="status-pill" id="statusPill"><span class="dot"></span><span id="statusText">Loading</span></div>
+		</header>
+
+		<section class="metrics" aria-label="Metrics">
+			<div class="metric"><div class="metric-label">Queue pending</div><div class="metric-value" id="pending">0</div></div>
+			<div class="metric"><div class="metric-label">Queue active</div><div class="metric-value" id="active">0</div></div>
+			<div class="metric"><div class="metric-label">Runners</div><div class="metric-value" id="runners">0</div></div>
+			<div class="metric"><div class="metric-label">Webhooks</div><div class="metric-value" id="webhooks">0</div></div>
+			<div class="metric"><div class="metric-label">Cooldown</div><div class="metric-value" id="cooldown">0s</div></div>
+		</section>
+
+		<section class="section">
+			<h2>Active Tasks</h2>
+			<div id="activeTasks"></div>
+		</section>
+
+		<section class="section">
+			<h2>Waiting Queue</h2>
+			<div id="pendingTasks"></div>
+		</section>
+
+		<section class="section">
+			<h2>Queue Settings</h2>
+			<div class="config" id="config"></div>
+		</section>
+	</main>
+
+	<script>
+		const els = {
+			statusPill: document.getElementById("statusPill"),
+			statusText: document.getElementById("statusText"),
+			updated: document.getElementById("updated"),
+			pending: document.getElementById("pending"),
+			active: document.getElementById("active"),
+			runners: document.getElementById("runners"),
+			webhooks: document.getElementById("webhooks"),
+			cooldown: document.getElementById("cooldown"),
+			activeTasks: document.getElementById("activeTasks"),
+			pendingTasks: document.getElementById("pendingTasks"),
+			config: document.getElementById("config"),
+		};
+
+		function formatDuration(ms) {
+			if (!Number.isFinite(ms) || ms <= 0) return "0s";
+			const totalSeconds = Math.round(ms / 1000);
+			const hours = Math.floor(totalSeconds / 3600);
+			const minutes = Math.floor((totalSeconds % 3600) / 60);
+			const seconds = totalSeconds % 60;
+			if (hours) return hours + "h " + minutes + "m";
+			if (minutes) return minutes + "m " + seconds + "s";
+			return seconds + "s";
+		}
+
+		function text(value) {
+			return value === undefined || value === null || value === "" ? "-" : String(value);
+		}
+
+		function createTable(columns, rows) {
+			if (!rows.length) {
+				const empty = document.createElement("div");
+				empty.className = "empty";
+				empty.textContent = "No items";
+				return empty;
+			}
+
+			const wrap = document.createElement("div");
+			wrap.className = "table-wrap";
+			const table = document.createElement("table");
+			const thead = document.createElement("thead");
+			const headRow = document.createElement("tr");
+			for (const column of columns) {
+				const th = document.createElement("th");
+				th.textContent = column.label;
+				headRow.appendChild(th);
+			}
+			thead.appendChild(headRow);
+			table.appendChild(thead);
+
+			const tbody = document.createElement("tbody");
+			for (const row of rows) {
+				const tr = document.createElement("tr");
+				for (const column of columns) {
+					const td = document.createElement("td");
+					const value = column.value(row);
+					if (column.code) {
+						const code = document.createElement("code");
+						code.textContent = text(value);
+						td.appendChild(code);
+					} else {
+						td.textContent = text(value);
+					}
+					tr.appendChild(td);
+				}
+				tbody.appendChild(tr);
+			}
+			table.appendChild(tbody);
+			wrap.appendChild(table);
+			return wrap;
+		}
+
+		function setChildren(node, child) {
+			node.replaceChildren(child);
+		}
+
+		function render(data) {
+			const queue = data.linearQueue || {};
+			const status = data.status || "unknown";
+
+			els.statusPill.className = "status-pill " + (status === "busy" ? "busy" : status === "idle" ? "" : "error");
+			els.statusText.textContent = status.toUpperCase();
+			els.updated.textContent = "Last updated " + new Date().toLocaleString();
+			els.pending.textContent = text(queue.pending || 0);
+			els.active.textContent = text(queue.active || 0);
+			els.runners.textContent = text(data.activeRunnerCount || 0);
+			els.webhooks.textContent = text(data.activeWebhookCount || 0);
+			els.cooldown.textContent = formatDuration(queue.cooldownRemainingMs || 0);
+
+			setChildren(
+				els.activeTasks,
+				createTable(
+					[
+						{ label: "Issue", value: (row) => row.issueIdentifier, code: true },
+						{ label: "Session", value: (row) => row.sessionId, code: true },
+						{ label: "Retry", value: (row) => row.retryCount },
+						{ label: "Queued", value: (row) => formatDuration(row.queuedForMs) },
+						{ label: "Running", value: (row) => formatDuration(row.runningForMs) },
+						{ label: "Last error", value: (row) => row.lastError },
+					],
+					queue.activeItems || [],
+				),
+			);
+
+			setChildren(
+				els.pendingTasks,
+				createTable(
+					[
+						{ label: "#", value: (row) => row.position },
+						{ label: "Issue", value: (row) => row.issueIdentifier, code: true },
+						{ label: "Session", value: (row) => row.sessionId, code: true },
+						{ label: "Retry", value: (row) => row.retryCount },
+						{ label: "Queued", value: (row) => formatDuration(row.queuedForMs) },
+						{ label: "Available in", value: (row) => formatDuration(row.availableInMs) },
+						{ label: "Last error", value: (row) => row.lastError },
+					],
+					queue.pendingItems || [],
+				),
+			);
+
+			els.config.replaceChildren();
+			const configItems = [
+				["Concurrency", queue.concurrency],
+				["Max retries", queue.maxRetries],
+				["Retry delay", formatDuration(queue.retryDelayMs || 0)],
+				["Timeout", formatDuration(queue.sessionTimeoutMs || 0)],
+				["Cooldown until", queue.cooldownUntil || "-"],
+				["Next available", queue.nextAvailableAt || "-"],
+			];
+			for (const item of configItems) {
+				const span = document.createElement("span");
+				span.textContent = item[0] + ": " + text(item[1]);
+				els.config.appendChild(span);
+			}
+		}
+
+		async function load() {
+			try {
+				const response = await fetch("/status", { cache: "no-store" });
+				if (!response.ok) throw new Error("HTTP " + response.status);
+				render(await response.json());
+			} catch (error) {
+				els.statusPill.className = "status-pill error";
+				els.statusText.textContent = "ERROR";
+				els.updated.innerHTML = "";
+				const span = document.createElement("span");
+				span.className = "error-text";
+				span.textContent = "Failed to load status: " + error.message;
+				els.updated.appendChild(span);
+			}
+		}
+
+		load();
+		setInterval(load, 5000);
+	</script>
+</body>
+</html>`;
 	}
 
 	/**
@@ -2581,6 +3006,88 @@ ${taskSection}`;
 		}
 
 		return "idle";
+	}
+
+	private buildStatusPayload() {
+		return {
+			status: this.computeStatus(),
+			activeWebhookCount: this.activeWebhookCount,
+			activeRunnerCount: this.getActiveRunnerCount(),
+			linearQueue: this.buildLinearQueueStatus(),
+		};
+	}
+
+	private buildLinearQueueStatus() {
+		const now = Date.now();
+		const cooldownRemainingMs = Math.max(
+			0,
+			this.linearSessionCooldownUntil - now,
+		);
+		const nextAvailableAt = this.linearSessionQueue.reduce<number | null>(
+			(soonest, item) =>
+				soonest === null
+					? item.availableAt
+					: Math.min(soonest, item.availableAt),
+			null,
+		);
+
+		return {
+			pending: this.linearSessionQueue.length,
+			active: this.linearSessionActiveItems.size,
+			concurrency: this.linearSessionQueueConcurrency,
+			cooldownUntil:
+				this.linearSessionCooldownUntil > now
+					? new Date(this.linearSessionCooldownUntil).toISOString()
+					: null,
+			cooldownRemainingMs,
+			nextAvailableAt: nextAvailableAt
+				? new Date(nextAvailableAt).toISOString()
+				: null,
+			maxRetries: this.linearSessionMaxRetries,
+			retryDelayMs: this.linearSessionRetryDelayMs,
+			sessionTimeoutMs: this.linearSessionTimeoutMs,
+			activeItems: Array.from(this.linearSessionActiveItems.values()).map(
+				(item) => ({
+					sessionId: item.sessionId,
+					issueIdentifier: item.issueIdentifier,
+					retryCount: item.retryCount,
+					queuedForMs: Math.max(0, now - item.queuedAt),
+					runningForMs: item.startedAt ? Math.max(0, now - item.startedAt) : 0,
+					startedAt: item.startedAt
+						? new Date(item.startedAt).toISOString()
+						: null,
+					lastError: item.lastError,
+				}),
+			),
+			pendingItems: this.linearSessionQueue.map((item, index) => ({
+				position: index + 1,
+				sessionId: item.sessionId,
+				issueIdentifier: item.issueIdentifier,
+				retryCount: item.retryCount,
+				queuedForMs: Math.max(0, now - item.queuedAt),
+				availableInMs: Math.max(0, item.availableAt - now),
+				availableAt: item.availableAt
+					? new Date(item.availableAt).toISOString()
+					: null,
+				lastError: item.lastError,
+			})),
+		};
+	}
+
+	private getActiveRunnerCount(): number {
+		let activeRunnerCount = 0;
+		const runners = this.agentSessionManager.getAllAgentRunners();
+		for (const runner of runners) {
+			if (runner.isRunning()) {
+				activeRunnerCount++;
+			}
+		}
+
+		if (this.chatSessionHandler?.isAnyRunnerBusy()) {
+			activeRunnerCount++;
+		}
+
+		return activeRunnerCount;
 	}
 
 	/**
@@ -4397,7 +4904,18 @@ ${taskSection}`;
 		item: LinearSessionQueueItem,
 	): Promise<void> {
 		try {
-			await this.postLinearQueueAcknowledgment(item, "starting");
+			const canStart = await this.postLinearQueueAcknowledgment(
+				item,
+				"starting",
+			);
+			if (!canStart) {
+				await this.requeueOrFailLinearSessionItem(
+					item,
+					new Error("Linear rate limit while posting queue start"),
+					true,
+				);
+				return;
+			}
 			await this.runLinearSessionQueueItemWithWatchdog(item);
 		} catch (error) {
 			const isRateLimited = this.applyLinearRateLimitCooldown(error);
@@ -4517,7 +5035,7 @@ ${taskSection}`;
 	private async postLinearQueueAcknowledgment(
 		item: LinearSessionQueueItem,
 		state: "queued" | "starting",
-	): Promise<void> {
+	): Promise<boolean> {
 		try {
 			const waitingCount = this.linearSessionQueue.length;
 			const body =
@@ -4530,11 +5048,13 @@ ${taskSection}`;
 				item.webhook.organizationId,
 				body,
 			);
+			return true;
 		} catch (error) {
-			this.applyLinearRateLimitCooldown(error);
+			const isRateLimited = this.applyLinearRateLimitCooldown(error);
 			this.logger.warn(
 				`Failed to post Linear queue acknowledgment for ${item.issueIdentifier}: ${this.formatLinearQueueError(error)}`,
 			);
+			return !isRateLimited;
 		}
 	}
 
@@ -4678,17 +5198,25 @@ ${taskSection}`;
 
 			this.linearSessionQueue = items
 				.filter((item) => item?.sessionId && item?.webhook)
-				.map((item) => ({
-					...item,
-					repoIds: Array.isArray(item.repoIds) ? item.repoIds : [],
-					retryCount:
-						item.state === "running" ? item.retryCount + 1 : item.retryCount,
-					availableAt:
-						item.state === "running"
-							? now + this.linearSessionRetryDelayMs
-							: item.availableAt || now,
-					startedAt: undefined,
-				}));
+				.map((item) => {
+					const retryCount = Number.isFinite(item.retryCount)
+						? item.retryCount
+						: 0;
+					const availableAt = Number.isFinite(item.availableAt)
+						? item.availableAt
+						: now;
+
+					return {
+						...item,
+						repoIds: Array.isArray(item.repoIds) ? item.repoIds : [],
+						retryCount: item.state === "running" ? retryCount + 1 : retryCount,
+						availableAt:
+							item.state === "running"
+								? now + this.linearSessionRetryDelayMs
+								: availableAt,
+						startedAt: undefined,
+					};
+				});
 
 			if (this.linearSessionQueue.length > 0) {
 				this.logger.info(

@@ -3,7 +3,7 @@ import type {
 	SDKSystemMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { ClaudeMessageFormatter } from "cyrus-claude-runner";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSessionManager } from "../src/AgentSessionManager";
 import type { IActivitySink } from "../src/sinks/IActivitySink";
 
@@ -22,10 +22,14 @@ describe("AgentSessionManager - empty assistant thought suppression", () => {
 	let manager: AgentSessionManager;
 	let mockActivitySink: IActivitySink;
 	let postActivitySpy: ReturnType<typeof vi.fn>;
+	let previousStreamActions: string | undefined;
 	const sessionId = "test-session-empty-thought";
 	const issueId = "issue-empty-thought";
 
 	beforeEach(() => {
+		previousStreamActions = process.env.CYRUS_LINEAR_STREAM_ACTIONS;
+		process.env.CYRUS_LINEAR_STREAM_ACTIONS = "true";
+
 		mockActivitySink = {
 			id: "test-workspace",
 			postActivity: vi.fn().mockResolvedValue({ activityId: "activity-1" }),
@@ -56,6 +60,14 @@ describe("AgentSessionManager - empty assistant thought suppression", () => {
 			constructor: { name: "ClaudeRunner" },
 		} as unknown as Parameters<typeof manager.addAgentRunner>[1];
 		manager.addAgentRunner(sessionId, runnerStub);
+	});
+
+	afterEach(() => {
+		if (previousStreamActions === undefined) {
+			delete process.env.CYRUS_LINEAR_STREAM_ACTIONS;
+		} else {
+			process.env.CYRUS_LINEAR_STREAM_ACTIONS = previousStreamActions;
+		}
 	});
 
 	function buildEmptyTextAssistantMessage(uuid: string): SDKAssistantMessage {

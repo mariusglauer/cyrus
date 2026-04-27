@@ -73,7 +73,7 @@ No comments yet.
 		expect(result.systemPrompt).toBeDefined();
 		expect(result.systemPrompt).toContain("<task_management_instructions>");
 		expect(result.systemPrompt).toContain(
-			"CRITICAL: You MUST use the Task tools",
+			"Keep task tracking lightweight and useful.",
 		);
 		expect(result.systemPrompt).not.toContain("builder");
 		expect(result.systemPrompt).not.toContain("debugger");

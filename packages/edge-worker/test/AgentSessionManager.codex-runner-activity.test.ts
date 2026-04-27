@@ -3,7 +3,7 @@ import {
 	CodexRunner,
 	type MapperContext,
 } from "cyrus-codex-runner";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSessionManager } from "../src/AgentSessionManager";
 import type { IActivitySink } from "../src/sinks/IActivitySink";
 
@@ -12,10 +12,14 @@ describe("AgentSessionManager - Codex tool activity mapping", () => {
 	let mapper: CodexEventMapper;
 	let mockActivitySink: IActivitySink;
 	let postActivitySpy: ReturnType<typeof vi.fn>;
+	let previousStreamActions: string | undefined;
 	const sessionId = "test-session-codex";
 	const issueId = "issue-codex";
 
 	beforeEach(() => {
+		previousStreamActions = process.env.CYRUS_LINEAR_STREAM_ACTIONS;
+		process.env.CYRUS_LINEAR_STREAM_ACTIONS = "true";
+
 		mockActivitySink = {
 			id: "test-workspace",
 			postActivity: vi.fn().mockResolvedValue({ activityId: "activity-123" }),
@@ -60,6 +64,14 @@ describe("AgentSessionManager - Codex tool activity mapping", () => {
 		);
 		manager.setActivitySink(sessionId, mockActivitySink);
 		manager.addAgentRunner(sessionId, runner);
+	});
+
+	afterEach(() => {
+		if (previousStreamActions === undefined) {
+			delete process.env.CYRUS_LINEAR_STREAM_ACTIONS;
+		} else {
+			process.env.CYRUS_LINEAR_STREAM_ACTIONS = previousStreamActions;
+		}
 	});
 
 	it("creates Linear action entries for Codex file_change events", async () => {
