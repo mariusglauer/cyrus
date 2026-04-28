@@ -2635,9 +2635,7 @@ export class EdgeWorker extends EventEmitter {
 					},
 				);
 
-				if (markedPullRequestDraft) {
-					await this.setGitHubPullRequestDraftState(event, false);
-				}
+				await this.setGitHubPullRequestDraftState(event, false);
 
 				// When session completes, post the reply back to GitHub
 				await this.postGitHubReply(event, runner, repository);
