@@ -48,6 +48,22 @@ const AUTO_PR_MAX_BUFFER = 10 * 1024 * 1024;
 // biome-ignore lint/complexity/noBannedTypes: Empty events type (events removed in CYPACK-996 skill refactor)
 export type AgentSessionManagerEvents = {};
 
+type OperationalAlertHandler = (alert: {
+	key: string;
+	severity: "info" | "warning" | "error";
+	title: string;
+	message: string;
+}) => void | Promise<void>;
+
+type PullRequestInfo = {
+	url?: string;
+	isDraft?: boolean;
+	title?: string;
+	body?: string;
+	baseRefName?: string;
+	headRefName?: string;
+};
+
 /**
  * Type-safe event emitter interface for AgentSessionManager
  */
@@ -100,6 +116,7 @@ export class AgentSessionManager extends EventEmitter {
 		prompt: string,
 		childSessionId: string,
 	) => Promise<void>;
+	private operationalAlertHandler?: OperationalAlertHandler;
 
 	constructor(
 		getParentSessionId?: (childSessionId: string) => string | undefined,
@@ -109,11 +126,13 @@ export class AgentSessionManager extends EventEmitter {
 			childSessionId: string,
 		) => Promise<void>,
 		logger?: ILogger,
+		operationalAlertHandler?: OperationalAlertHandler,
 	) {
 		super();
 		this.logger = logger ?? createLogger({ component: "AgentSessionManager" });
 		this.getParentSessionId = getParentSessionId;
 		this.resumeParentSession = resumeParentSession;
+		this.operationalAlertHandler = operationalAlertHandler;
 	}
 
 	/**
@@ -537,12 +556,12 @@ export class AgentSessionManager extends EventEmitter {
 				currentBranch,
 			]);
 
-			const existingPrUrl = await this.findExistingPullRequestUrl(
+			const existingPullRequest = await this.findExistingPullRequest(
 				repoDir,
 				currentBranch,
 			);
 			const pullRequestUrl =
-				existingPrUrl ??
+				existingPullRequest?.url ??
 				(await this.createPullRequest(
 					repoDir,
 					currentBranch,
@@ -550,14 +569,32 @@ export class AgentSessionManager extends EventEmitter {
 					session,
 					resultMessage,
 				));
+			await this.ensurePullRequestMeetsRequirements(repoDir, pullRequestUrl, {
+				issueIdentifier,
+				baseBranch,
+				branch: currentBranch,
+				session,
+				resultMessage,
+			});
 
 			return this.appendResultNote(resultMessage, pullRequestUrl);
 		} catch (error) {
+			const errorMessage =
+				error instanceof Error ? error.message : String(error);
 			this.sessionLog(sessionId).error(
 				`Failed to create or update pull request:`,
 				error,
 			);
-			return resultMessage;
+			await this.postOperationalAlert({
+				key: `linear-pr-automation-failed:${issueIdentifier}`,
+				severity: "error",
+				title: "Linear PR automation failed",
+				message: `${issueIdentifier}: ${errorMessage}`,
+			});
+			return this.appendResultWarning(
+				resultMessage,
+				`PR automation failed: ${errorMessage}`,
+			);
 		}
 	}
 
@@ -587,10 +624,10 @@ export class AgentSessionManager extends EventEmitter {
 		return "main";
 	}
 
-	private async findExistingPullRequestUrl(
+	private async findExistingPullRequest(
 		repoDir: string,
 		branch: string,
-	): Promise<string | undefined> {
+	): Promise<PullRequestInfo | undefined> {
 		const result = await this.tryWorkspaceCommand(repoDir, "gh", [
 			"pr",
 			"list",
@@ -599,30 +636,19 @@ export class AgentSessionManager extends EventEmitter {
 			"--state",
 			"open",
 			"--json",
-			"url,isDraft",
+			"url,isDraft,title,body,baseRefName,headRefName",
 		]);
 		if (!result) {
 			return undefined;
 		}
 
-		const pullRequests = JSON.parse(result.stdout || "[]") as Array<{
-			url?: string;
-			isDraft?: boolean;
-		}>;
+		const pullRequests = JSON.parse(result.stdout || "[]") as PullRequestInfo[];
 		const pullRequest = pullRequests[0];
 		if (!pullRequest?.url) {
 			return undefined;
 		}
 
-		if (pullRequest.isDraft) {
-			await this.tryWorkspaceCommand(repoDir, "gh", [
-				"pr",
-				"ready",
-				pullRequest.url,
-			]);
-		}
-
-		return pullRequest.url;
+		return pullRequest;
 	}
 
 	private async createPullRequest(
@@ -634,13 +660,18 @@ export class AgentSessionManager extends EventEmitter {
 	): Promise<string> {
 		const issueIdentifier =
 			session.issueContext?.issueIdentifier ?? session.issue?.identifier;
-		const title = `${issueIdentifier}: ${this.cleanPullRequestTitle(
+		const titlePrefix = issueIdentifier ? `${issueIdentifier}: ` : "";
+		const title = `${titlePrefix}${this.cleanPullRequestTitle(
 			session.issue?.title ?? "Cyrus changes",
 		)}`;
-		const body =
+		const rawBody =
 			"result" in resultMessage && typeof resultMessage.result === "string"
 				? resultMessage.result
 				: `Automated changes for ${issueIdentifier}.`;
+		const body = this.ensurePullRequestBodyMentionsIssue(
+			rawBody,
+			issueIdentifier,
+		);
 		const result = await this.runWorkspaceCommand(repoDir, "gh", [
 			"pr",
 			"create",
@@ -655,6 +686,128 @@ export class AgentSessionManager extends EventEmitter {
 		]);
 
 		return result.stdout.trim();
+	}
+
+	private async ensurePullRequestMeetsRequirements(
+		repoDir: string,
+		pullRequestUrl: string,
+		options: {
+			issueIdentifier: string;
+			baseBranch: string;
+			branch: string;
+			session: CyrusAgentSession;
+			resultMessage: SDKResultMessage;
+		},
+	): Promise<void> {
+		let pullRequest = await this.getPullRequestInfo(repoDir, pullRequestUrl);
+		const titlePrefix = `${options.issueIdentifier}:`;
+		const expectedTitle = `${titlePrefix} ${this.cleanPullRequestTitle(
+			options.session.issue?.title ?? "Cyrus changes",
+		)}`;
+
+		if (pullRequest.isDraft) {
+			await this.runWorkspaceCommand(repoDir, "gh", [
+				"pr",
+				"ready",
+				pullRequestUrl,
+			]);
+		}
+
+		if (!pullRequest.title?.startsWith(titlePrefix)) {
+			await this.runWorkspaceCommand(repoDir, "gh", [
+				"pr",
+				"edit",
+				pullRequestUrl,
+				"--title",
+				expectedTitle,
+			]);
+		}
+
+		if (
+			pullRequest.baseRefName &&
+			pullRequest.baseRefName !== options.baseBranch
+		) {
+			await this.runWorkspaceCommand(repoDir, "gh", [
+				"pr",
+				"edit",
+				pullRequestUrl,
+				"--base",
+				options.baseBranch,
+			]);
+		}
+
+		const body = this.ensurePullRequestBodyMentionsIssue(
+			pullRequest.body ??
+				("result" in options.resultMessage &&
+				typeof options.resultMessage.result === "string"
+					? options.resultMessage.result
+					: ""),
+			options.issueIdentifier,
+		);
+		if (body !== (pullRequest.body ?? "")) {
+			await this.runWorkspaceCommand(repoDir, "gh", [
+				"pr",
+				"edit",
+				pullRequestUrl,
+				"--body",
+				body,
+			]);
+		}
+
+		pullRequest = await this.getPullRequestInfo(repoDir, pullRequestUrl);
+		if (pullRequest.isDraft) {
+			throw new Error(`Pull request is still a draft: ${pullRequestUrl}`);
+		}
+		if (!pullRequest.title?.startsWith(titlePrefix)) {
+			throw new Error(
+				`Pull request title must start with ${titlePrefix}: ${pullRequestUrl}`,
+			);
+		}
+		if (
+			pullRequest.baseRefName &&
+			pullRequest.baseRefName !== options.baseBranch
+		) {
+			throw new Error(
+				`Pull request base is ${pullRequest.baseRefName}, expected ${options.baseBranch}: ${pullRequestUrl}`,
+			);
+		}
+		if (pullRequest.headRefName && pullRequest.headRefName !== options.branch) {
+			throw new Error(
+				`Pull request head is ${pullRequest.headRefName}, expected ${options.branch}: ${pullRequestUrl}`,
+			);
+		}
+	}
+
+	private async getPullRequestInfo(
+		repoDir: string,
+		pullRequestUrl: string,
+	): Promise<PullRequestInfo> {
+		const result = await this.runWorkspaceCommand(repoDir, "gh", [
+			"pr",
+			"view",
+			pullRequestUrl,
+			"--json",
+			"url,isDraft,title,body,baseRefName,headRefName",
+		]);
+		const pullRequest = JSON.parse(result.stdout || "{}") as PullRequestInfo;
+		if (!pullRequest.url) {
+			throw new Error(`Unable to verify pull request: ${pullRequestUrl}`);
+		}
+		return pullRequest;
+	}
+
+	private ensurePullRequestBodyMentionsIssue(
+		body: string,
+		issueIdentifier?: string,
+	): string {
+		const trimmedBody = body.trim();
+		if (!issueIdentifier) {
+			return trimmedBody || "Automated changes from Cyrus.";
+		}
+		if (trimmedBody.includes(issueIdentifier)) {
+			return trimmedBody || `Automated changes for ${issueIdentifier}.`;
+		}
+		return `${trimmedBody}\n\nLinear issue: ${issueIdentifier}`.trim();
 	}
 
 	private cleanPullRequestTitle(title: string): string {
@@ -677,6 +830,41 @@ export class AgentSessionManager extends EventEmitter {
 			...resultMessage,
 			result: `${resultMessage.result.trim()}\n\nPull request: ${pullRequestUrl}`,
 		} as SDKResultMessage;
+	}
+
+	private appendResultWarning(
+		resultMessage: SDKResultMessage,
+		warning: string,
+	): SDKResultMessage {
+		if (
+			!("result" in resultMessage) ||
+			typeof resultMessage.result !== "string" ||
+			resultMessage.result.includes(warning)
+		) {
+			return resultMessage;
+		}
+
+		return {
+			...resultMessage,
+			result: `${resultMessage.result.trim()}\n\n${warning}`,
+		} as SDKResultMessage;
+	}
+
+	private async postOperationalAlert(alert: {
+		key: string;
+		severity: "info" | "warning" | "error";
+		title: string;
+		message: string;
+	}): Promise<void> {
+		try {
+			await this.operationalAlertHandler?.(alert);
+		} catch (error) {
+			this.logger.warn(
+				`Failed to post operational alert: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			);
+		}
 	}
 
 	private async runWorkspaceCommand(

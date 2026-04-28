@@ -363,6 +363,8 @@ export class RunnerConfigBuilder {
 			modelOverride ||
 			input.repository.model ||
 			this.runnerSelector.getDefaultModelForRunner(runnerType);
+		const codexReasoningEffort =
+			runnerType === "codex" ? this.resolveCodexReasoningEffort() : undefined;
 
 		const resolvedWorkspaceId =
 			input.linearWorkspaceId ??
@@ -415,6 +417,9 @@ export class RunnerConfigBuilder {
 			),
 			// Priority order: label override > repository config > global default
 			model: finalModel,
+			...(codexReasoningEffort
+				? { modelReasoningEffort: codexReasoningEffort }
+				: {}),
 			fallbackModel:
 				fallbackModelOverride ||
 				input.repository.fallbackModel ||
@@ -484,6 +489,21 @@ export class RunnerConfigBuilder {
 		}
 
 		return { config, runnerType };
+	}
+
+	private resolveCodexReasoningEffort(): string | undefined {
+		const value =
+			process.env.CYRUS_CODEX_REASONING_EFFORT ||
+			process.env.CYRUS_CODEX_DEFAULT_REASONING_EFFORT ||
+			process.env.CODEX_REASONING_EFFORT;
+		if (!value) {
+			return undefined;
+		}
+
+		const normalized = value.trim().toLowerCase();
+		return ["minimal", "low", "medium", "high", "xhigh"].includes(normalized)
+			? normalized
+			: undefined;
 	}
 
 	/**

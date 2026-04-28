@@ -162,4 +162,79 @@ describe("EdgeWorker - GitHub review comments", () => {
 		expect(instructions).toContain("src/checkout.ts:10-12");
 		expect(instructions).toContain("Use strict null handling here.");
 	});
+
+	it("marks a GitHub PR as draft before follow-up work", async () => {
+		const fetchMock = vi
+			.fn()
+			.mockResolvedValueOnce({
+				ok: true,
+				json: vi.fn().mockResolvedValue({
+					node_id: "PR_kwDOExample",
+					draft: false,
+				}),
+			})
+			.mockResolvedValueOnce({
+				ok: true,
+				json: vi.fn().mockResolvedValue({
+					data: {
+						convertPullRequestToDraft: {
+							pullRequest: { isDraft: true },
+						},
+					},
+				}),
+			});
+		vi.stubGlobal("fetch", fetchMock);
+
+		const changed = await (edgeWorker as any).setGitHubPullRequestDraftState(
+			reviewEvent,
+			true,
+		);
+
+		expect(changed).toBe(true);
+		expect(fetchMock).toHaveBeenNthCalledWith(
+			1,
+			"https://api.github.com/repos/acme/web/pulls/12",
+			expect.objectContaining({
+				headers: expect.objectContaining({
+					Authorization: "Bearer token",
+				}),
+			}),
+		);
+		const graphBody = JSON.parse(fetchMock.mock.calls[1][1].body);
+		expect(graphBody.query).toContain("convertPullRequestToDraft");
+		expect(graphBody.variables).toEqual({ id: "PR_kwDOExample" });
+	});
+
+	it("marks a GitHub PR ready after follow-up work", async () => {
+		const fetchMock = vi
+			.fn()
+			.mockResolvedValueOnce({
+				ok: true,
+				json: vi.fn().mockResolvedValue({
+					node_id: "PR_kwDOExample",
+					draft: true,
+				}),
+			})
+			.mockResolvedValueOnce({
+				ok: true,
+				json: vi.fn().mockResolvedValue({
+					data: {
+						markPullRequestReadyForReview: {
+							pullRequest: { isDraft: false },
+						},
+					},
+				}),
+			});
+		vi.stubGlobal("fetch", fetchMock);
+
+		const changed = await (edgeWorker as any).setGitHubPullRequestDraftState(
+			reviewEvent,
+			false,
+		);
+
+		expect(changed).toBe(true);
+		const graphBody = JSON.parse(fetchMock.mock.calls[1][1].body);
+		expect(graphBody.query).toContain("markPullRequestReadyForReview");
+		expect(graphBody.variables).toEqual({ id: "PR_kwDOExample" });
+	});
 });

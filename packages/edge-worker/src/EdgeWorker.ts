@@ -210,10 +210,23 @@ type LinearSessionQueueItem = {
 	retryCount: number;
 	lastError?: string;
 	startedAt?: number;
+	recoveredAt?: number;
 };
 
 type SerializedLinearSessionQueueItem = LinearSessionQueueItem & {
 	state?: "queued" | "running";
+};
+
+type OperationalAlertSeverity = "info" | "warning" | "error";
+
+type OperationalAlert = {
+	key: string;
+	severity: OperationalAlertSeverity;
+	title: string;
+	message: string;
+	createdAt: number;
+	lastSentAt?: number;
+	sendCount: number;
 };
 
 /**
@@ -256,6 +269,9 @@ export class EdgeWorker extends EventEmitter {
 		new Map();
 	private linearSessionQueueFile: string;
 	private linearSessionQueueDrainTimer: NodeJS.Timeout | null = null;
+	private operationalMonitorTimer: NodeJS.Timeout | null = null;
+	private operationalAlerts: OperationalAlert[] = [];
+	private operationalAlertLastSentByKey = new Map<string, number>();
 	private linearSessionCooldownUntil = 0;
 	private readonly linearSessionQueueConcurrency = Math.max(
 		1,
@@ -283,6 +299,31 @@ export class EdgeWorker extends EventEmitter {
 			process.env.CYRUS_LINEAR_RATE_LIMIT_COOLDOWN_MS || "3900000",
 			10,
 		) || 3_900_000,
+	);
+	private readonly operationalMonitorIntervalMs = Math.max(
+		30_000,
+		Number.parseInt(
+			process.env.CYRUS_ALERT_MONITOR_INTERVAL_MS || "60000",
+			10,
+		) || 60_000,
+	);
+	private readonly queueWaitAlertMs = Math.max(
+		60_000,
+		Number.parseInt(process.env.CYRUS_ALERT_QUEUE_WAIT_MS || "900000", 10) ||
+			900_000,
+	);
+	private readonly activeTaskAlertMs = Math.max(
+		60_000,
+		Number.parseInt(
+			process.env.CYRUS_ALERT_ACTIVE_TASK_MS ||
+				String(Math.min(this.linearSessionTimeoutMs, 5_400_000)),
+			10,
+		) || Math.min(this.linearSessionTimeoutMs, 5_400_000),
+	);
+	private readonly operationalAlertDedupeMs = Math.max(
+		60_000,
+		Number.parseInt(process.env.CYRUS_ALERT_DEDUPE_MS || "1800000", 10) ||
+			1_800_000,
 	);
 	/** Handler for AskUserQuestion tool invocations via Linear select signal */
 	private askUserQuestionHandler: AskUserQuestionHandler;
@@ -544,6 +585,8 @@ export class EdgeWorker extends EventEmitter {
 					childSessionId,
 				);
 			},
+			undefined,
+			(alert) => this.sendOperationalAlert(alert),
 		);
 
 		// Initialize repositories with path resolution
@@ -767,6 +810,13 @@ export class EdgeWorker extends EventEmitter {
 
 		await this.loadLinearSessionQueue();
 		this.drainLinearSessionQueue();
+		this.startOperationalMonitor();
+		void this.sendOperationalAlert({
+			key: "process-start",
+			severity: "info",
+			title: "Cyrus restarted",
+			message: "Cyrus started and loaded its durable queue.",
+		});
 	}
 
 	/**
@@ -1196,6 +1246,11 @@ export class EdgeWorker extends EventEmitter {
 		</section>
 
 		<section class="section">
+			<h2>Recent Alerts</h2>
+			<div id="recentAlerts"></div>
+		</section>
+
+		<section class="section">
 			<h2>Queue Settings</h2>
 			<div class="config" id="config"></div>
 		</section>
@@ -1213,6 +1268,7 @@ export class EdgeWorker extends EventEmitter {
 			cooldown: document.getElementById("cooldown"),
 			activeTasks: document.getElementById("activeTasks"),
 			pendingTasks: document.getElementById("pendingTasks"),
+			recentAlerts: document.getElementById("recentAlerts"),
 			config: document.getElementById("config"),
 		};
 
@@ -1300,6 +1356,7 @@ export class EdgeWorker extends EventEmitter {
 						{ label: "Retry", value: (row) => row.retryCount },
 						{ label: "Queued", value: (row) => formatDuration(row.queuedForMs) },
 						{ label: "Running", value: (row) => formatDuration(row.runningForMs) },
+						{ label: "Recovered", value: (row) => row.recoveredAt || "-" },
 						{ label: "Last error", value: (row) => row.lastError },
 					],
 					queue.activeItems || [],
@@ -1316,14 +1373,31 @@ export class EdgeWorker extends EventEmitter {
 						{ label: "Retry", value: (row) => row.retryCount },
 						{ label: "Queued", value: (row) => formatDuration(row.queuedForMs) },
 						{ label: "Available in", value: (row) => formatDuration(row.availableInMs) },
+						{ label: "Recovered", value: (row) => row.recoveredAt || "-" },
 						{ label: "Last error", value: (row) => row.lastError },
 					],
 					queue.pendingItems || [],
 				),
 			);
 
+			setChildren(
+				els.recentAlerts,
+				createTable(
+					[
+						{ label: "Severity", value: (row) => row.severity },
+						{ label: "Title", value: (row) => row.title },
+						{ label: "Message", value: (row) => row.message },
+						{ label: "Created", value: (row) => row.createdAt },
+						{ label: "Sent", value: (row) => row.lastSentAt || "-" },
+						{ label: "Count", value: (row) => row.sendCount },
+					],
+					data.recentAlerts || [],
+				),
+			);
+
 			els.config.replaceChildren();
 			const configItems = [
+				["Durable queue", queue.durable ? "enabled" : "disabled"],
 				["Concurrency", queue.concurrency],
 				["Max retries", queue.maxRetries],
 				["Retry delay", formatDuration(queue.retryDelayMs || 0)],
@@ -1689,6 +1763,111 @@ export class EdgeWorker extends EventEmitter {
 		return process.env.GITHUB_TOKEN;
 	}
 
+	private async setGitHubPullRequestDraftState(
+		event: GitHubCommentWebhookEvent,
+		draft: boolean,
+	): Promise<boolean> {
+		const prNumber = extractPRNumber(event);
+		if (!prNumber) {
+			return false;
+		}
+
+		const token = await this.resolveGitHubToken(event);
+		if (!token) {
+			this.logger.warn(
+				"Cannot update GitHub PR draft state: no installation token or GITHUB_TOKEN configured",
+			);
+			return false;
+		}
+
+		const owner = extractRepoOwner(event);
+		const repo = extractRepoName(event);
+		const repoFullName = extractRepoFullName(event);
+
+		try {
+			const prResponse = await fetch(
+				`https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`,
+				{
+					headers: {
+						Authorization: `Bearer ${token}`,
+						Accept: "application/vnd.github+json",
+						"X-GitHub-Api-Version": "2022-11-28",
+					},
+				},
+			);
+			if (!prResponse.ok) {
+				const errorBody = await prResponse.text();
+				throw new Error(
+					`GitHub pull request lookup failed: ${prResponse.status} ${prResponse.statusText} - ${errorBody}`,
+				);
+			}
+
+			const pullRequest = (await prResponse.json()) as {
+				node_id?: string;
+				draft?: boolean;
+			};
+			if (!pullRequest.node_id) {
+				throw new Error("GitHub pull request response did not include node_id");
+			}
+			if (pullRequest.draft === draft) {
+				return false;
+			}
+
+			const mutation = draft
+				? `mutation($id: ID!) {
+					convertPullRequestToDraft(input: { pullRequestId: $id }) {
+						pullRequest { isDraft }
+					}
+				}`
+				: `mutation($id: ID!) {
+					markPullRequestReadyForReview(input: { pullRequestId: $id }) {
+						pullRequest { isDraft }
+					}
+				}`;
+
+			const graphResponse = await fetch("https://api.github.com/graphql", {
+				method: "POST",
+				headers: {
+					Authorization: `Bearer ${token}`,
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify({
+					query: mutation,
+					variables: { id: pullRequest.node_id },
+				}),
+			});
+			const graphBody = (await graphResponse.json().catch(() => null)) as {
+				errors?: Array<{ message?: string }>;
+			} | null;
+			if (!graphResponse.ok || graphBody?.errors?.length) {
+				throw new Error(
+					graphBody?.errors?.map((error) => error.message).join("; ") ||
+						`GitHub GraphQL mutation failed: ${graphResponse.status} ${graphResponse.statusText}`,
+				);
+			}
+
+			this.logger.info(
+				`Marked ${repoFullName}#${prNumber} as ${
+					draft ? "draft" : "ready for review"
+				}`,
+			);
+			return true;
+		} catch (error) {
+			const action = draft ? "draft" : "ready for review";
+			const message = error instanceof Error ? error.message : String(error);
+			this.logger.warn(
+				`Failed to mark ${repoFullName}#${prNumber} as ${action}: ${message}`,
+			);
+			void this.sendOperationalAlert({
+				key: `github-pr-draft-state:${repoFullName}#${prNumber}:${action}`,
+				severity: "warning",
+				title: "GitHub PR state update failed",
+				message: `Could not mark ${repoFullName}#${prNumber} as ${action}: ${message}`,
+			});
+			return false;
+		}
+	}
+
 	private async handleGitHubWebhook(
 		event: GitHubCommentWebhookEvent,
 	): Promise<void> {
@@ -1875,6 +2054,10 @@ export class EdgeWorker extends EventEmitter {
 			const taskInstructions = isPullRequestReview
 				? await this.buildGitHubChangeRequestInstructions(event, commentBody)
 				: stripMention(commentBody, mentionHandle);
+			const markedPullRequestDraft = await this.setGitHubPullRequestDraftState(
+				event,
+				true,
+			);
 
 			// Check for an existing multi-repo session that includes this repository.
 			// If found, use its sub-worktree instead of creating a new workspace.
@@ -2034,9 +2217,15 @@ export class EdgeWorker extends EventEmitter {
 			);
 
 			// Start the session and handle completion
+			let completed = false;
 			try {
 				const sessionInfo = await runner.start(taskInstructions);
 				this.logger.info(`GitHub session started: ${sessionInfo.sessionId}`);
+				completed = true;
+
+				if (markedPullRequestDraft) {
+					await this.setGitHubPullRequestDraftState(event, false);
+				}
 
 				// When session completes, post the reply back to GitHub
 				await this.postGitHubReply(event, runner, repository);
@@ -2045,6 +2234,14 @@ export class EdgeWorker extends EventEmitter {
 					`GitHub session error for ${repoFullName}#${prNumber}`,
 					error instanceof Error ? error : new Error(String(error)),
 				);
+				if (markedPullRequestDraft && !completed) {
+					void this.sendOperationalAlert({
+						key: `github-followup-failed:${repoFullName}#${prNumber}`,
+						severity: "error",
+						title: "GitHub follow-up failed",
+						message: `${repoFullName}#${prNumber} was left as draft because Cyrus did not complete successfully.`,
+					});
+				}
 			} finally {
 				await this.savePersistedState();
 			}
@@ -2481,6 +2678,7 @@ ${taskInstructions}
 - You are already checked out on the PR branch \`${branchRef}\`
 - Make changes directly to the code on this branch
 - After making changes, commit and push them to the branch
+- Cyrus manages the PR draft/ready state automatically for this follow-up
 - Be concise in your responses as they will be posted back to the GitHub PR`;
 	}
 
@@ -2509,6 +2707,7 @@ ${reviewBody}
 - You are already checked out on the PR branch \`${branchRef}\`
 - Address all the reviewer's feedback and make the necessary changes
 - After making changes, commit and push them to the branch
+- Cyrus manages the PR draft/ready state automatically for this follow-up
 - Respond with a concise summary of the changes you made`
 			: `## Instructions
 - The reviewer has requested changes but did not leave a summary comment
@@ -2516,6 +2715,7 @@ ${reviewBody}
 - You are already checked out on the PR branch \`${branchRef}\`
 - Address all the reviewer's feedback and make the necessary changes
 - After making changes, commit and push them to the branch
+- Cyrus manages the PR draft/ready state automatically for this follow-up
 - Respond with a concise summary of the changes you made`;
 
 		return `You are working on a GitHub Pull Request that has received a change request review.
@@ -3169,6 +3369,16 @@ ${taskSection}`;
 			activeWebhookCount: this.activeWebhookCount,
 			activeRunnerCount: this.getActiveRunnerCount(),
 			linearQueue: this.buildLinearQueueStatus(),
+			recentAlerts: this.operationalAlerts.slice(0, 10).map((alert) => ({
+				severity: alert.severity,
+				title: alert.title,
+				message: alert.message,
+				createdAt: new Date(alert.createdAt).toISOString(),
+				lastSentAt: alert.lastSentAt
+					? new Date(alert.lastSentAt).toISOString()
+					: null,
+				sendCount: alert.sendCount,
+			})),
 		};
 	}
 
@@ -3187,6 +3397,7 @@ ${taskSection}`;
 		);
 
 		return {
+			durable: true,
 			pending: this.linearSessionQueue.length,
 			active: this.linearSessionActiveItems.size,
 			concurrency: this.linearSessionQueueConcurrency,
@@ -3208,6 +3419,9 @@ ${taskSection}`;
 					retryCount: item.retryCount,
 					queuedForMs: Math.max(0, now - item.queuedAt),
 					runningForMs: item.startedAt ? Math.max(0, now - item.startedAt) : 0,
+					recoveredAt: item.recoveredAt
+						? new Date(item.recoveredAt).toISOString()
+						: null,
 					startedAt: item.startedAt
 						? new Date(item.startedAt).toISOString()
 						: null,
@@ -3221,6 +3435,9 @@ ${taskSection}`;
 				retryCount: item.retryCount,
 				queuedForMs: Math.max(0, now - item.queuedAt),
 				availableInMs: Math.max(0, item.availableAt - now),
+				recoveredAt: item.recoveredAt
+					? new Date(item.recoveredAt).toISOString()
+					: null,
 				availableAt: item.availableAt
 					? new Date(item.availableAt).toISOString()
 					: null,
@@ -3243,6 +3460,143 @@ ${taskSection}`;
 		}
 
 		return activeRunnerCount;
+	}
+
+	private startOperationalMonitor(): void {
+		if (this.operationalMonitorTimer) {
+			clearInterval(this.operationalMonitorTimer);
+		}
+
+		this.checkOperationalHealth();
+		this.operationalMonitorTimer = setInterval(() => {
+			this.checkOperationalHealth();
+		}, this.operationalMonitorIntervalMs);
+	}
+
+	private checkOperationalHealth(): void {
+		const now = Date.now();
+
+		for (const item of this.linearSessionQueue) {
+			const queuedForMs = Math.max(0, now - item.queuedAt);
+			if (queuedForMs >= this.queueWaitAlertMs) {
+				void this.sendOperationalAlert({
+					key: `linear-queue-wait:${item.sessionId}`,
+					severity: "warning",
+					title: "Linear task waiting in queue",
+					message: `${item.issueIdentifier} has been queued for ${Math.round(
+						queuedForMs / 60_000,
+					)} minutes.`,
+				});
+			}
+		}
+
+		for (const item of this.linearSessionActiveItems.values()) {
+			const runningForMs = item.startedAt
+				? Math.max(0, now - item.startedAt)
+				: 0;
+			if (runningForMs >= this.activeTaskAlertMs) {
+				void this.sendOperationalAlert({
+					key: `linear-active-stuck:${item.sessionId}`,
+					severity: "warning",
+					title: "Linear task running for a long time",
+					message: `${item.issueIdentifier} has been running for ${Math.round(
+						runningForMs / 60_000,
+					)} minutes.`,
+				});
+			}
+		}
+
+		if (this.linearSessionCooldownUntil > now) {
+			void this.sendOperationalAlert({
+				key: "linear-rate-limit-cooldown",
+				severity: "warning",
+				title: "Linear queue is rate limited",
+				message: `Queue paused until ${new Date(
+					this.linearSessionCooldownUntil,
+				).toISOString()}.`,
+			});
+		}
+	}
+
+	private async sendOperationalAlert(input: {
+		key: string;
+		severity: OperationalAlertSeverity;
+		title: string;
+		message: string;
+	}): Promise<void> {
+		const now = Date.now();
+		const lastSentAt = this.operationalAlertLastSentByKey.get(input.key);
+		const shouldSend =
+			!lastSentAt || now - lastSentAt >= this.operationalAlertDedupeMs;
+
+		const existing = this.operationalAlerts.find(
+			(alert) => alert.key === input.key,
+		);
+		if (existing) {
+			existing.severity = input.severity;
+			existing.title = input.title;
+			existing.message = input.message;
+			if (shouldSend) {
+				existing.lastSentAt = now;
+				existing.sendCount += 1;
+			}
+		} else {
+			this.operationalAlerts.unshift({
+				...input,
+				createdAt: now,
+				lastSentAt: shouldSend ? now : undefined,
+				sendCount: shouldSend ? 1 : 0,
+			});
+			this.operationalAlerts = this.operationalAlerts.slice(0, 50);
+		}
+
+		if (!shouldSend) {
+			return;
+		}
+
+		this.operationalAlertLastSentByKey.set(input.key, now);
+		await this.postSlackOperationalAlert(input);
+	}
+
+	private async postSlackOperationalAlert(input: {
+		severity: OperationalAlertSeverity;
+		title: string;
+		message: string;
+	}): Promise<void> {
+		const token = process.env.SLACK_BOT_TOKEN?.trim();
+		const channel =
+			process.env.CYRUS_ALERT_SLACK_CHANNEL_ID?.trim() ||
+			process.env.CYRUS_ALERT_SLACK_CHANNEL?.trim();
+		if (!token || !channel) {
+			return;
+		}
+
+		const response = await fetch("https://slack.com/api/chat.postMessage", {
+			method: "POST",
+			headers: {
+				authorization: `Bearer ${token}`,
+				"content-type": "application/json; charset=utf-8",
+			},
+			body: JSON.stringify({
+				channel,
+				text: `[${input.severity.toUpperCase()}] ${input.title}: ${
+					input.message
+				}`,
+				unfurl_links: false,
+				unfurl_media: false,
+			}),
+		});
+		const body = (await response.json().catch(() => null)) as {
+			ok?: boolean;
+			error?: string;
+		} | null;
+		if (!response.ok || body?.ok === false) {
+			this.logger.warn(
+				`Failed to post Slack operational alert: ${
+					body?.error || response.statusText
+				}`,
+			);
+		}
 	}
 
 	/**
@@ -3315,10 +3669,16 @@ ${taskSection}`;
 	 * Stop the edge worker
 	 */
 	async stop(): Promise<void> {
+		if (this.operationalMonitorTimer) {
+			clearInterval(this.operationalMonitorTimer);
+			this.operationalMonitorTimer = null;
+		}
+
 		// Stop config file watcher
 		await this.configManager.stop();
 
 		try {
+			await this.saveLinearSessionQueue();
 			await this.savePersistedState();
 			this.logger.info("✅ EdgeWorker state saved successfully");
 		} catch (error) {
@@ -5161,6 +5521,14 @@ ${taskSection}`;
 			this.logger.error(
 				`Linear agent session ${item.issueIdentifier} failed after ${item.retryCount} retries: ${errorMessage}`,
 			);
+			void this.sendOperationalAlert({
+				key: `linear-session-failed:${item.sessionId}`,
+				severity: "error",
+				title: "Linear task failed",
+				message: `${item.issueIdentifier} failed after ${
+					this.linearSessionMaxRetries + 1
+				} attempt(s): ${errorMessage}`,
+			});
 			if (!isRateLimited) {
 				await this.postLinearQueueFailure(item, errorMessage);
 			}
@@ -5246,6 +5614,14 @@ ${taskSection}`;
 				this.linearSessionCooldownUntil,
 			).toISOString()}`,
 		);
+		void this.sendOperationalAlert({
+			key: "linear-rate-limit-cooldown",
+			severity: "warning",
+			title: "Linear queue is rate limited",
+			message: `Queue paused until ${new Date(
+				this.linearSessionCooldownUntil,
+			).toISOString()}.`,
+		});
 		return true;
 	}
 
@@ -5350,25 +5726,33 @@ ${taskSection}`;
 				| { items?: SerializedLinearSessionQueueItem[] };
 			const items = Array.isArray(parsed) ? parsed : parsed.items || [];
 			const now = Date.now();
+			let recoveredRunningCount = 0;
 
 			this.linearSessionQueue = items
 				.filter((item) => item?.sessionId && item?.webhook)
 				.map((item) => {
+					const wasRunning = item.state === "running";
 					const retryCount = Number.isFinite(item.retryCount)
 						? item.retryCount
 						: 0;
 					const availableAt = Number.isFinite(item.availableAt)
 						? item.availableAt
 						: now;
+					if (wasRunning) {
+						recoveredRunningCount++;
+					}
 
 					return {
 						...item,
 						repoIds: Array.isArray(item.repoIds) ? item.repoIds : [],
-						retryCount: item.state === "running" ? retryCount + 1 : retryCount,
-						availableAt:
-							item.state === "running"
-								? now + this.linearSessionRetryDelayMs
-								: availableAt,
+						retryCount: wasRunning ? retryCount + 1 : retryCount,
+						availableAt: wasRunning
+							? now + this.linearSessionRetryDelayMs
+							: availableAt,
+						lastError: wasRunning
+							? "Recovered after Cyrus restart; retrying automatically."
+							: item.lastError,
+						recoveredAt: wasRunning ? now : item.recoveredAt,
 						startedAt: undefined,
 					};
 				});
@@ -5377,6 +5761,15 @@ ${taskSection}`;
 				this.logger.info(
 					`Loaded ${this.linearSessionQueue.length} Linear queue item(s) from disk`,
 				);
+			}
+			if (recoveredRunningCount > 0) {
+				await this.saveLinearSessionQueue();
+				void this.sendOperationalAlert({
+					key: "linear-queue-recovered-running",
+					severity: "warning",
+					title: "Recovered interrupted Linear work",
+					message: `${recoveredRunningCount} running task(s) were restored from the durable queue and will be retried automatically.`,
+				});
 			}
 		} catch (error) {
 			this.logger.error(
