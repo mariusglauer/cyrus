@@ -796,7 +796,7 @@ export function inspectGitGuardrail(cwd: string, log: ILogger): string | null {
 		"1. Commit any uncommitted changes with a descriptive message.\n" +
 		"2. Push the branch to the remote.\n" +
 		"3. Create or update a pull request that summarizes the change.\n" +
-		"4. For frontend/UI changes, keep at least one relevant screenshot file in the workspace so Cyrus can attach it to the GitHub PR.\n\n" +
+		"4. For frontend/UI changes, capture at least one fresh screenshot before finishing when the app can reasonably be rendered locally. Save it under `cyrus-screenshots/` or another workspace path containing `screenshot`, leave it uncommitted, and state the exact blocker if a meaningful screenshot is impossible.\n\n" +
 		"If the work is genuinely complete and a PR is not appropriate (for example, a question or research task with no intended code changes), you may stop again — this guardrail only blocks once per session."
 	);
 }

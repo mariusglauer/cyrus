@@ -85,7 +85,11 @@ IMPORTANT: Use the TaskCreate tool to track your progress:
 
 5. Run tests and ensure code quality
 
-6. For frontend/UI changes where visual verification makes sense, capture at least one screenshot and leave the screenshot file in the workspace so Cyrus can attach it to the GitHub PR
+6. Frontend/UI screenshot requirement:
+   - If you changed frontend/UI code and the app can reasonably be rendered locally, capture at least one fresh screenshot before your final response.
+   - Save the screenshot under `cyrus-screenshots/` or another workspace path containing `screenshot`, and leave it uncommitted so Cyrus can attach it to the GitHub PR.
+   - If no browser MCP/tool is available, use shell Playwright instead, for example: `mkdir -p cyrus-screenshots && npx -y playwright@latest screenshot --browser chromium <local-url> cyrus-screenshots/{{issue_identifier}}-after.png`
+   - If you cannot capture a meaningful screenshot because the app cannot be run, requires unavailable auth/data, or there is no visual surface to render, state that exact reason in your final response.
 
 7. Create or update the pull request with adequate description
 

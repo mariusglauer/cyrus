@@ -3091,7 +3091,7 @@ ${taskInstructions}
 - Make changes directly to the code on this branch
 - After making changes, commit and push them to the branch
 - Cyrus manages the PR draft/ready state automatically for this follow-up
-- For frontend/UI changes where visual verification makes sense, capture at least one screenshot and leave the screenshot file in the workspace so Cyrus can attach it to the PR
+- For frontend/UI changes, capture at least one fresh screenshot before finishing when the app can reasonably be rendered locally. Save it under \`cyrus-screenshots/\` or another workspace path containing \`screenshot\`, leave it uncommitted, and use shell Playwright if no browser MCP/tool is available, e.g. \`mkdir -p cyrus-screenshots && npx -y playwright@latest screenshot --browser chromium <local-url> cyrus-screenshots/pr-${prNumber}-after.png\`. If a meaningful screenshot is impossible, state the exact blocker in your response.
 - Be concise in your responses as they will be posted back to the GitHub PR`;
 	}
 
@@ -3121,7 +3121,7 @@ ${reviewBody}
 - Address all the reviewer's feedback and make the necessary changes
 - After making changes, commit and push them to the branch
 - Cyrus manages the PR draft/ready state automatically for this follow-up
-- For frontend/UI changes where visual verification makes sense, capture at least one screenshot and leave the screenshot file in the workspace so Cyrus can attach it to the PR
+- For frontend/UI changes, capture at least one fresh screenshot before finishing when the app can reasonably be rendered locally. Save it under \`cyrus-screenshots/\` or another workspace path containing \`screenshot\`, leave it uncommitted, and use shell Playwright if no browser MCP/tool is available, e.g. \`mkdir -p cyrus-screenshots && npx -y playwright@latest screenshot --browser chromium <local-url> cyrus-screenshots/pr-${prNumber}-after.png\`. If a meaningful screenshot is impossible, state the exact blocker in your response.
 - Respond with a concise summary of the changes you made`
 			: `## Instructions
 - The reviewer has requested changes but did not leave a summary comment
@@ -3130,7 +3130,7 @@ ${reviewBody}
 - Address all the reviewer's feedback and make the necessary changes
 - After making changes, commit and push them to the branch
 - Cyrus manages the PR draft/ready state automatically for this follow-up
-- For frontend/UI changes where visual verification makes sense, capture at least one screenshot and leave the screenshot file in the workspace so Cyrus can attach it to the PR
+- For frontend/UI changes, capture at least one fresh screenshot before finishing when the app can reasonably be rendered locally. Save it under \`cyrus-screenshots/\` or another workspace path containing \`screenshot\`, leave it uncommitted, and use shell Playwright if no browser MCP/tool is available, e.g. \`mkdir -p cyrus-screenshots && npx -y playwright@latest screenshot --browser chromium <local-url> cyrus-screenshots/pr-${prNumber}-after.png\`. If a meaningful screenshot is impossible, state the exact blocker in your response.
 - Respond with a concise summary of the changes you made`;
 
 		return `You are working on a GitHub Pull Request that has received a change request review.
