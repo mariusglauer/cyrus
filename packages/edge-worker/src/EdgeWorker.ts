@@ -1873,8 +1873,7 @@ export class EdgeWorker extends EventEmitter {
 			// For other events, strip the bot mention to get the task instructions
 			const mentionHandle = botUsername ? `@${botUsername}` : "@cyrusagent";
 			const taskInstructions = isPullRequestReview
-				? commentBody ||
-					"A reviewer has requested changes on this PR. Read the review comments to understand what needs to be changed."
+				? await this.buildGitHubChangeRequestInstructions(event, commentBody)
 				: stripMention(commentBody, mentionHandle);
 
 			// Check for an existing multi-repo session that includes this repository.
@@ -2237,6 +2236,162 @@ Your base branch \`${branchName}\` has received ${commitCount} new commit(s). Co
 			);
 			return null;
 		}
+	}
+
+	private async buildGitHubChangeRequestInstructions(
+		event: GitHubCommentWebhookEvent,
+		reviewBody: string,
+	): Promise<string> {
+		const inlineComments = await this.fetchGitHubReviewComments(event);
+		const sections: string[] = [];
+
+		if (reviewBody.trim()) {
+			sections.push(`## Review Summary\n${reviewBody.trim()}`);
+		}
+
+		if (inlineComments) {
+			sections.push(`## Inline Review Comments\n${inlineComments}`);
+		}
+
+		if (sections.length > 0) {
+			return sections.join("\n\n");
+		}
+
+		return "A reviewer has requested changes on this PR. Read the review comments to understand what needs to be changed.";
+	}
+
+	private async fetchGitHubReviewComments(
+		event: GitHubCommentWebhookEvent,
+	): Promise<string> {
+		if (!isPullRequestReviewPayload(event.payload)) {
+			return "";
+		}
+
+		const prNumber = extractPRNumber(event);
+		if (!prNumber) {
+			return "";
+		}
+
+		const token = await this.resolveGitHubToken(event);
+		if (!token) {
+			this.logger.warn(
+				"Cannot fetch GitHub review comments: no installation token or GITHUB_TOKEN configured",
+			);
+			return "";
+		}
+
+		const owner = extractRepoOwner(event);
+		const repo = extractRepoName(event);
+		const reviewId = event.payload.review.id;
+
+		try {
+			const response = await fetch(
+				`https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}/reviews/${reviewId}/comments`,
+				{
+					headers: {
+						Accept: "application/vnd.github+json",
+						Authorization: `Bearer ${token}`,
+						"X-GitHub-Api-Version": "2022-11-28",
+					},
+				},
+			);
+
+			if (!response.ok) {
+				this.logger.warn(
+					`Failed to fetch GitHub review comments for ${owner}/${repo}#${prNumber}: ${response.status}`,
+				);
+				return "";
+			}
+
+			const comments = (await response.json()) as Array<{
+				body?: string;
+				path?: string;
+				line?: number | null;
+				start_line?: number | null;
+				original_line?: number | null;
+				diff_hunk?: string;
+				html_url?: string;
+				user?: { login?: string };
+			}>;
+
+			if (!Array.isArray(comments) || comments.length === 0) {
+				return "";
+			}
+
+			const maxComments = 50;
+			const formattedComments = comments
+				.slice(0, maxComments)
+				.map((comment, index) =>
+					this.formatGitHubReviewCommentForPrompt(comment, index),
+				)
+				.join("\n\n");
+			const omittedCount = comments.length - maxComments;
+
+			return omittedCount > 0
+				? `${formattedComments}\n\n_... ${omittedCount} additional review comment(s) omitted. Use \`gh api repos/${owner}/${repo}/pulls/${prNumber}/reviews/${reviewId}/comments\` if needed._`
+				: formattedComments;
+		} catch (error) {
+			this.logger.error(
+				"Failed to fetch GitHub review comments",
+				error instanceof Error ? error : new Error(String(error)),
+			);
+			return "";
+		}
+	}
+
+	private formatGitHubReviewCommentForPrompt(
+		comment: {
+			body?: string;
+			path?: string;
+			line?: number | null;
+			start_line?: number | null;
+			original_line?: number | null;
+			diff_hunk?: string;
+			html_url?: string;
+			user?: { login?: string };
+		},
+		index: number,
+	): string {
+		const locationParts = [
+			comment.path,
+			this.formatGitHubReviewCommentLine(comment),
+		].filter(Boolean);
+		const location =
+			locationParts.length > 0 ? locationParts.join(":") : "general";
+		const author = comment.user?.login ? `@${comment.user.login}` : "reviewer";
+		const body = comment.body?.trim() || "(no comment body)";
+		const urlLine = comment.html_url ? `\nURL: ${comment.html_url}` : "";
+		const diffHunk = comment.diff_hunk
+			? `\nDiff context:\n${this.truncateGitHubReviewDiffHunk(comment.diff_hunk)}`
+			: "";
+
+		return `### Comment ${index + 1} (${location})\nAuthor: ${author}${urlLine}\nFeedback:\n${body}${diffHunk}`;
+	}
+
+	private formatGitHubReviewCommentLine(comment: {
+		line?: number | null;
+		start_line?: number | null;
+		original_line?: number | null;
+	}): string | undefined {
+		if (
+			comment.start_line &&
+			comment.line &&
+			comment.start_line !== comment.line
+		) {
+			return `${comment.start_line}-${comment.line}`;
+		}
+
+		const line = comment.line ?? comment.original_line;
+		return line ? String(line) : undefined;
+	}
+
+	private truncateGitHubReviewDiffHunk(diffHunk: string): string {
+		const maxLength = 1_500;
+		if (diffHunk.length <= maxLength) {
+			return diffHunk;
+		}
+
+		return `${diffHunk.slice(0, maxLength)}\n... [diff hunk truncated]`;
 	}
 
 	/**
