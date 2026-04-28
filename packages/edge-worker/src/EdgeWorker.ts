@@ -1199,6 +1199,15 @@ export class EdgeWorker extends EventEmitter {
 			font-size: 12px;
 		}
 
+		a {
+			color: var(--accent);
+			text-decoration: none;
+			font-weight: 600;
+		}
+
+		a:hover { text-decoration: underline; }
+		a code { color: inherit; }
+
 		.empty {
 			padding: 18px 0;
 			color: var(--muted);
@@ -1336,12 +1345,24 @@ export class EdgeWorker extends EventEmitter {
 				for (const column of columns) {
 					const td = document.createElement("td");
 					const value = column.value(row);
+					const href = column.href ? column.href(row) : "";
+					let target = td;
+					if (href) {
+						const link = document.createElement("a");
+						link.href = href;
+						link.target = "_blank";
+						link.rel = "noreferrer";
+						target = link;
+					}
 					if (column.code) {
 						const code = document.createElement("code");
 						code.textContent = text(value);
-						td.appendChild(code);
+						target.appendChild(code);
 					} else {
-						td.textContent = text(value);
+						target.textContent = text(value);
+					}
+					if (target !== td) {
+						td.appendChild(target);
 					}
 					tr.appendChild(td);
 				}
@@ -1374,7 +1395,7 @@ export class EdgeWorker extends EventEmitter {
 				createTable(
 					[
 						{ label: "Origin", value: (row) => row.origin },
-						{ label: "Issue", value: (row) => row.issueIdentifier, code: true },
+						{ label: "Task / PR", value: (row) => row.issueIdentifier, href: (row) => row.workItemUrl, code: true },
 						{ label: "Session", value: (row) => row.sessionId, code: true },
 						{ label: "Retry", value: (row) => row.retryCount },
 						{ label: "Queued", value: (row) => formatDuration(row.queuedForMs) },
@@ -1392,7 +1413,7 @@ export class EdgeWorker extends EventEmitter {
 					[
 						{ label: "#", value: (row) => row.position },
 						{ label: "Origin", value: (row) => row.origin },
-						{ label: "Issue", value: (row) => row.issueIdentifier, code: true },
+						{ label: "Task / PR", value: (row) => row.issueIdentifier, href: (row) => row.workItemUrl, code: true },
 						{ label: "Session", value: (row) => row.sessionId, code: true },
 						{ label: "Retry", value: (row) => row.retryCount },
 						{ label: "Queued", value: (row) => formatDuration(row.queuedForMs) },
@@ -3630,6 +3651,7 @@ ${taskSection}`;
 					origin: item.origin,
 					sessionId: item.sessionId,
 					issueIdentifier: item.workItemIdentifier,
+					workItemUrl: this.getAgentQueueItemUrl(item),
 					retryCount: item.retryCount,
 					queuedForMs: Math.max(0, now - item.queuedAt),
 					runningForMs: item.startedAt ? Math.max(0, now - item.startedAt) : 0,
@@ -3647,6 +3669,7 @@ ${taskSection}`;
 				position: index + 1,
 				sessionId: item.sessionId,
 				issueIdentifier: item.workItemIdentifier,
+				workItemUrl: this.getAgentQueueItemUrl(item),
 				retryCount: item.retryCount,
 				queuedForMs: Math.max(0, now - item.queuedAt),
 				availableInMs: Math.max(0, item.availableAt - now),
@@ -3659,6 +3682,99 @@ ${taskSection}`;
 				lastError: item.lastError,
 			})),
 		};
+	}
+
+	private getAgentQueueItemUrl(item: AgentSessionQueueItem): string | null {
+		if (item.origin === "github") {
+			return this.getGitHubQueueItemUrl(item);
+		}
+
+		if (item.origin === "linear") {
+			return this.getLinearQueueItemUrl(item);
+		}
+
+		return null;
+	}
+
+	private getLinearQueueItemUrl(item: AgentSessionQueueItem): string | null {
+		const issue = item.webhook?.agentSession?.issue as
+			| { url?: unknown; identifier?: unknown }
+			| undefined;
+		if (typeof issue?.url === "string" && issue.url.trim()) {
+			return issue.url.trim();
+		}
+
+		const identifier =
+			typeof issue?.identifier === "string" && issue.identifier.trim()
+				? issue.identifier.trim()
+				: item.workItemIdentifier;
+		if (!/^[A-Z][A-Z0-9]+-\d+$/i.test(identifier)) {
+			return null;
+		}
+
+		const workspaceSlug = this.getLinearWorkspaceSlugForQueueItem(item);
+		if (!workspaceSlug) {
+			return null;
+		}
+
+		return `https://linear.app/${encodeURIComponent(workspaceSlug)}/issue/${encodeURIComponent(identifier)}`;
+	}
+
+	private getLinearWorkspaceSlugForQueueItem(
+		item: AgentSessionQueueItem,
+	): string | undefined {
+		const webhook = item.webhook as { organizationId?: unknown } | undefined;
+		const organizationId =
+			typeof webhook?.organizationId === "string"
+				? webhook.organizationId
+				: undefined;
+		const workspaceSlug = organizationId
+			? this.config.linearWorkspaces?.[organizationId]?.linearWorkspaceSlug
+			: undefined;
+		if (workspaceSlug) {
+			return workspaceSlug;
+		}
+
+		const fallbackSlug =
+			process.env.CYRUS_LINEAR_WORKSPACE_SLUG ||
+			process.env.LINEAR_WORKSPACE_SLUG;
+		if (fallbackSlug) {
+			return fallbackSlug;
+		}
+
+		const workspaceConfigs = Object.values(this.config.linearWorkspaces ?? {});
+		if (workspaceConfigs.length === 1) {
+			return workspaceConfigs[0]?.linearWorkspaceSlug;
+		}
+
+		return undefined;
+	}
+
+	private getGitHubQueueItemUrl(item: AgentSessionQueueItem): string | null {
+		const payload = item.githubEvent?.payload as
+			| {
+					pull_request?: { html_url?: unknown };
+					issue?: { html_url?: unknown };
+			  }
+			| undefined;
+		const payloadUrl =
+			typeof payload?.pull_request?.html_url === "string"
+				? payload.pull_request.html_url
+				: typeof payload?.issue?.html_url === "string"
+					? payload.issue.html_url
+					: undefined;
+		if (payloadUrl?.trim()) {
+			return payloadUrl.trim();
+		}
+
+		const match = item.workItemIdentifier.match(
+			/^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)#(\d+)$/,
+		);
+		if (!match?.[1] || !match?.[2]) {
+			return null;
+		}
+
+		return `https://github.com/${match[1]}/pull/${match[2]}`;
 	}
 
 	private getActiveRunnerCount(): number {
