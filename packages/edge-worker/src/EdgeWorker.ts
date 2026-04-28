@@ -1,9 +1,9 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { LinearClient } from "@linear/sdk";
 import type {
 	McpServerConfig,
@@ -56,6 +56,7 @@ import {
 	CLIRPCServer,
 	createLogger,
 	DEFAULT_PROXY_URL,
+	getDefaultWorktreesDir,
 	isAgentSessionCreatedWebhook,
 	isAgentSessionPromptedWebhook,
 	isContentUpdateMessage,
@@ -241,6 +242,42 @@ type OperationalAlert = {
 	sendCount: number;
 };
 
+type GarbageCollectionSummary = {
+	reason: string;
+	startedAt: string;
+	finishedAt?: string;
+	scannedWorktrees: number;
+	removedWorktrees: number;
+	scannedBranches: number;
+	removedLocalBranches: number;
+	removedRemoteBranches: number;
+	removedSessions: number;
+	removedRegistrySessions: number;
+	skippedProtected: number;
+	skippedOpenPullRequests: number;
+	skippedUnknownPullRequests: number;
+	errors: string[];
+};
+
+type GarbageCollectionProtection = {
+	issueIdentifiers: Set<string>;
+	branchNames: Set<string>;
+};
+
+type WorktreeBranchRef = {
+	path: string;
+	branch: string;
+	repoPath: string;
+};
+
+type PullRequestGarbageCollectionState = {
+	state?: string;
+	mergedAt?: string | null;
+	closedAt?: string | null;
+	url?: string;
+	headRefName?: string;
+};
+
 type LinearSessionLink = {
 	sessionId: string;
 	workspaceId: string;
@@ -288,6 +325,9 @@ export class EdgeWorker extends EventEmitter {
 	private linearSessionQueueFile: string;
 	private linearSessionQueueDrainTimer: NodeJS.Timeout | null = null;
 	private operationalMonitorTimer: NodeJS.Timeout | null = null;
+	private garbageCollectionTimer: NodeJS.Timeout | null = null;
+	private garbageCollectionRunning = false;
+	private lastGarbageCollectionSummary: GarbageCollectionSummary | null = null;
 	private operationalAlerts: OperationalAlert[] = [];
 	private operationalAlertLastSentByKey = new Map<string, number>();
 	private linearSessionCooldownUntil = 0;
@@ -325,6 +365,28 @@ export class EdgeWorker extends EventEmitter {
 			10,
 		) || 7_200_000,
 	);
+	private readonly garbageCollectionEnabled =
+		process.env.CYRUS_GC_ENABLED?.toLowerCase().trim() !== "false";
+	private readonly garbageCollectionIntervalMs = Math.max(
+		300_000,
+		Number.parseInt(process.env.CYRUS_GC_INTERVAL_MS || "21600000", 10) ||
+			21_600_000,
+	);
+	private readonly garbageCollectionSessionTtlMs = Math.max(
+		3_600_000,
+		Number.parseInt(process.env.CYRUS_GC_SESSION_TTL_MS || "604800000", 10) ||
+			604_800_000,
+	);
+	private readonly garbageCollectionTerminalPrGraceMs = Math.max(
+		0,
+		Number.parseInt(
+			process.env.CYRUS_GC_TERMINAL_PR_GRACE_MS || "3600000",
+			10,
+		) || 3_600_000,
+	);
+	private readonly garbageCollectionDeleteRemoteBranches =
+		process.env.CYRUS_GC_DELETE_REMOTE_BRANCHES?.toLowerCase().trim() ===
+		"true";
 	private readonly operationalMonitorIntervalMs = Math.max(
 		30_000,
 		Number.parseInt(
@@ -837,6 +899,7 @@ export class EdgeWorker extends EventEmitter {
 		await this.recoverInterruptedActiveLinearSessionsFromState();
 		this.drainLinearSessionQueue();
 		this.startOperationalMonitor();
+		this.startGarbageCollector();
 		void this.sendOperationalAlert({
 			key: "process-start",
 			severity: "info",
@@ -2068,8 +2131,8 @@ export class EdgeWorker extends EventEmitter {
 	private extractLinearIssueIdentifierFromText(
 		text: string,
 	): string | undefined {
-		const match = text.match(/\b[A-Z][A-Z0-9]+-\d+\b/);
-		return match?.[0];
+		const match = text.match(/\b[A-Z][A-Z0-9]+-\d+\b/i);
+		return match?.[0]?.toUpperCase();
 	}
 
 	private extractGitHubPullRequestBody(
@@ -3726,6 +3789,15 @@ ${taskSection}`;
 					: null,
 				sendCount: alert.sendCount,
 			})),
+			garbageCollection: {
+				enabled: this.garbageCollectionEnabled,
+				running: this.garbageCollectionRunning,
+				intervalMs: this.garbageCollectionIntervalMs,
+				sessionTtlMs: this.garbageCollectionSessionTtlMs,
+				terminalPrGraceMs: this.garbageCollectionTerminalPrGraceMs,
+				deleteRemoteBranches: this.garbageCollectionDeleteRemoteBranches,
+				lastRun: this.lastGarbageCollectionSummary,
+			},
 		};
 	}
 
@@ -3915,6 +3987,471 @@ ${taskSection}`;
 		this.operationalMonitorTimer = setInterval(() => {
 			this.checkOperationalHealth();
 		}, this.operationalMonitorIntervalMs);
+	}
+
+	private startGarbageCollector(): void {
+		if (!this.garbageCollectionEnabled) {
+			this.logger.info("Garbage collection disabled");
+			return;
+		}
+		if (this.garbageCollectionTimer) {
+			clearInterval(this.garbageCollectionTimer);
+		}
+
+		this.garbageCollectionTimer = setInterval(() => {
+			void this.runGarbageCollection("scheduled");
+		}, this.garbageCollectionIntervalMs);
+		this.garbageCollectionTimer.unref?.();
+
+		void this.runGarbageCollection("startup");
+	}
+
+	private async runGarbageCollection(reason: string): Promise<void> {
+		if (!this.garbageCollectionEnabled || this.garbageCollectionRunning) {
+			return;
+		}
+
+		this.garbageCollectionRunning = true;
+		const summary: GarbageCollectionSummary = {
+			reason,
+			startedAt: new Date().toISOString(),
+			scannedWorktrees: 0,
+			removedWorktrees: 0,
+			scannedBranches: 0,
+			removedLocalBranches: 0,
+			removedRemoteBranches: 0,
+			removedSessions: 0,
+			removedRegistrySessions: 0,
+			skippedProtected: 0,
+			skippedOpenPullRequests: 0,
+			skippedUnknownPullRequests: 0,
+			errors: [],
+		};
+
+		try {
+			summary.removedSessions = this.agentSessionManager.cleanup(
+				this.garbageCollectionSessionTtlMs,
+			);
+			summary.removedRegistrySessions = this.globalSessionRegistry.cleanup(
+				this.garbageCollectionSessionTtlMs,
+			);
+
+			const protection = this.buildGarbageCollectionProtection();
+			await this.collectGarbageFromWorktrees(protection, summary);
+			await this.collectGarbageFromLocalBranches(protection, summary);
+
+			if (summary.removedSessions > 0 || summary.removedRegistrySessions > 0) {
+				await this.savePersistedState();
+			}
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			summary.errors.push(message);
+			this.logger.error("Garbage collection failed", error);
+		} finally {
+			summary.finishedAt = new Date().toISOString();
+			this.lastGarbageCollectionSummary = summary;
+			this.garbageCollectionRunning = false;
+		}
+
+		if (
+			summary.removedWorktrees > 0 ||
+			summary.removedLocalBranches > 0 ||
+			summary.removedRemoteBranches > 0 ||
+			summary.removedSessions > 0 ||
+			summary.removedRegistrySessions > 0 ||
+			summary.errors.length > 0
+		) {
+			this.logger.info(
+				`Garbage collection finished: removed ${summary.removedWorktrees} worktree(s), ${summary.removedLocalBranches} local branch(es), ${summary.removedRemoteBranches} remote branch(es), ${summary.removedSessions} persisted session(s)`,
+			);
+		}
+	}
+
+	private buildGarbageCollectionProtection(): GarbageCollectionProtection {
+		const issueIdentifiers = new Set<string>();
+		const branchNames = new Set<string>();
+		const addIssueIdentifier = (identifier?: string | null) => {
+			if (identifier?.trim()) {
+				issueIdentifiers.add(identifier.trim().toLowerCase());
+			}
+		};
+		const addBranchName = (branchName?: string | null) => {
+			if (branchName?.trim()) {
+				branchNames.add(branchName.trim().toLowerCase());
+			}
+		};
+		const addQueueItem = (item: AgentSessionQueueItem) => {
+			if (item.origin === "linear") {
+				addIssueIdentifier(item.workItemIdentifier);
+				addIssueIdentifier(item.webhook?.agentSession?.issue?.identifier);
+				return;
+			}
+			addBranchName(
+				item.githubEvent ? extractPRBranchRef(item.githubEvent) : undefined,
+			);
+		};
+
+		for (const item of this.linearSessionQueue) {
+			addQueueItem(item);
+		}
+		for (const item of this.linearSessionActiveItems.values()) {
+			addQueueItem(item);
+		}
+		for (const session of this.agentSessionManager.getActiveSessions()) {
+			addIssueIdentifier(session.issueContext?.issueIdentifier);
+			addIssueIdentifier(session.issue?.identifier);
+			for (const repoContext of session.repositories) {
+				addBranchName(repoContext.branchName);
+			}
+		}
+		for (const parked of this.parkedSessions.values()) {
+			addIssueIdentifier(parked.agentSession.issue?.identifier);
+		}
+
+		return { issueIdentifiers, branchNames };
+	}
+
+	private async collectGarbageFromWorktrees(
+		protection: GarbageCollectionProtection,
+		summary: GarbageCollectionSummary,
+	): Promise<void> {
+		const worktreesDir = getDefaultWorktreesDir(this.cyrusHome);
+		if (!existsSync(worktreesDir)) {
+			return;
+		}
+
+		const entries = await readdir(worktreesDir, { withFileTypes: true });
+		for (const entry of entries) {
+			if (!entry.isDirectory()) {
+				continue;
+			}
+
+			const issueIdentifier = entry.name;
+			const workspacePath = join(worktreesDir, issueIdentifier);
+			summary.scannedWorktrees++;
+
+			if (this.isProtectedIssueIdentifier(issueIdentifier, protection)) {
+				summary.skippedProtected++;
+				continue;
+			}
+
+			const branchRefs = this.listWorktreeBranchRefs(workspacePath);
+			if (branchRefs.length === 0) {
+				summary.skippedUnknownPullRequests++;
+				continue;
+			}
+
+			const terminalRefs: Array<{
+				ref: WorktreeBranchRef;
+				pr: PullRequestGarbageCollectionState;
+			}> = [];
+			let canDeleteWorkspace = true;
+
+			for (const ref of branchRefs) {
+				if (
+					this.isProtectedBranch(ref.branch, protection) ||
+					!this.isCyrusGarbageCollectionBranch(ref.branch, issueIdentifier)
+				) {
+					summary.skippedProtected++;
+					canDeleteWorkspace = false;
+					break;
+				}
+
+				const pr = this.getPullRequestGarbageCollectionState(
+					ref.path,
+					ref.branch,
+				);
+				if (!pr) {
+					summary.skippedUnknownPullRequests++;
+					canDeleteWorkspace = false;
+					break;
+				}
+				if (!this.isTerminalPullRequestEligibleForGarbageCollection(pr)) {
+					summary.skippedOpenPullRequests++;
+					canDeleteWorkspace = false;
+					break;
+				}
+
+				terminalRefs.push({ ref, pr });
+			}
+
+			if (!canDeleteWorkspace || terminalRefs.length === 0) {
+				continue;
+			}
+
+			try {
+				this.gitService.deleteWorktree(issueIdentifier);
+				summary.removedWorktrees++;
+				for (const { ref, pr } of terminalRefs) {
+					this.deleteGarbageCollectedBranch(
+						ref.repoPath,
+						ref.branch,
+						pr,
+						summary,
+					);
+				}
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				summary.errors.push(
+					`Failed to remove worktree ${issueIdentifier}: ${message}`,
+				);
+			}
+		}
+	}
+
+	private async collectGarbageFromLocalBranches(
+		protection: GarbageCollectionProtection,
+		summary: GarbageCollectionSummary,
+	): Promise<void> {
+		for (const repository of this.repositories.values()) {
+			if (
+				!repository.repositoryPath ||
+				!existsSync(repository.repositoryPath)
+			) {
+				continue;
+			}
+
+			const checkedOutBranches = this.listCheckedOutBranches(
+				repository.repositoryPath,
+			);
+			for (const branch of this.listLocalBranches(repository.repositoryPath)) {
+				if (!this.isCyrusGarbageCollectionBranch(branch)) {
+					continue;
+				}
+
+				summary.scannedBranches++;
+				if (
+					checkedOutBranches.has(branch.toLowerCase()) ||
+					this.isProtectedBranch(branch, protection)
+				) {
+					summary.skippedProtected++;
+					continue;
+				}
+
+				const pr = this.getPullRequestGarbageCollectionState(
+					repository.repositoryPath,
+					branch,
+				);
+				if (!pr) {
+					summary.skippedUnknownPullRequests++;
+					continue;
+				}
+				if (!this.isTerminalPullRequestEligibleForGarbageCollection(pr)) {
+					summary.skippedOpenPullRequests++;
+					continue;
+				}
+
+				this.deleteGarbageCollectedBranch(
+					repository.repositoryPath,
+					branch,
+					pr,
+					summary,
+				);
+			}
+		}
+	}
+
+	private listWorktreeBranchRefs(workspacePath: string): WorktreeBranchRef[] {
+		const candidates = [workspacePath];
+		try {
+			for (const entry of readdirSync(workspacePath, { withFileTypes: true })) {
+				if (entry.isDirectory()) {
+					candidates.push(join(workspacePath, entry.name));
+				}
+			}
+		} catch {
+			// If listing subdirectories fails, still inspect the workspace root.
+		}
+
+		const refs: WorktreeBranchRef[] = [];
+		for (const path of candidates) {
+			if (!existsSync(join(path, ".git"))) {
+				continue;
+			}
+
+			const branch = this.readGitOutput(path, [
+				"rev-parse",
+				"--abbrev-ref",
+				"HEAD",
+			]);
+			if (!branch || branch === "HEAD") {
+				continue;
+			}
+
+			const gitCommonDir = this.readGitOutput(path, [
+				"rev-parse",
+				"--path-format=absolute",
+				"--git-common-dir",
+			]);
+			const repoPath = gitCommonDir?.endsWith(".git")
+				? dirname(gitCommonDir)
+				: path;
+			refs.push({ path, branch, repoPath });
+		}
+
+		return refs;
+	}
+
+	private listLocalBranches(repositoryPath: string): string[] {
+		const output = this.readGitOutput(repositoryPath, [
+			"for-each-ref",
+			"--format=%(refname:short)",
+			"refs/heads",
+		]);
+		if (!output) {
+			return [];
+		}
+
+		return output
+			.split("\n")
+			.map((branch) => branch.trim())
+			.filter(Boolean);
+	}
+
+	private listCheckedOutBranches(repositoryPath: string): Set<string> {
+		const output = this.readGitOutput(repositoryPath, [
+			"worktree",
+			"list",
+			"--porcelain",
+		]);
+		const branches = new Set<string>();
+		if (!output) {
+			return branches;
+		}
+
+		for (const line of output.split("\n")) {
+			if (line.startsWith("branch refs/heads/")) {
+				branches.add(line.slice("branch refs/heads/".length).toLowerCase());
+			}
+		}
+		return branches;
+	}
+
+	private readGitOutput(cwd: string, args: string[]): string | null {
+		try {
+			return execFileSync("git", args, {
+				cwd,
+				encoding: "utf8",
+				stdio: ["ignore", "pipe", "pipe"],
+				timeout: 20_000,
+			}).trim();
+		} catch {
+			return null;
+		}
+	}
+
+	private getPullRequestGarbageCollectionState(
+		cwd: string,
+		branch: string,
+	): PullRequestGarbageCollectionState | null {
+		try {
+			const raw = execFileSync(
+				"gh",
+				[
+					"pr",
+					"view",
+					branch,
+					"--json",
+					"state,mergedAt,closedAt,url,headRefName",
+				],
+				{
+					cwd,
+					encoding: "utf8",
+					stdio: ["ignore", "pipe", "pipe"],
+					timeout: 30_000,
+				},
+			);
+			return JSON.parse(raw) as PullRequestGarbageCollectionState;
+		} catch {
+			return null;
+		}
+	}
+
+	private isTerminalPullRequestEligibleForGarbageCollection(
+		pr: PullRequestGarbageCollectionState,
+	): boolean {
+		const state = pr.state?.toUpperCase();
+		if (state !== "MERGED" && state !== "CLOSED") {
+			return false;
+		}
+
+		const terminalAt = Date.parse(pr.mergedAt ?? pr.closedAt ?? "");
+		if (!Number.isFinite(terminalAt)) {
+			return true;
+		}
+
+		return Date.now() - terminalAt >= this.garbageCollectionTerminalPrGraceMs;
+	}
+
+	private deleteGarbageCollectedBranch(
+		repositoryPath: string,
+		branch: string,
+		pr: PullRequestGarbageCollectionState,
+		summary: GarbageCollectionSummary,
+	): void {
+		try {
+			execFileSync("git", ["branch", "-D", branch], {
+				cwd: repositoryPath,
+				stdio: "pipe",
+				timeout: 20_000,
+			});
+			summary.removedLocalBranches++;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			summary.errors.push(
+				`Failed to delete local branch ${branch}: ${message}`,
+			);
+		}
+
+		if (!this.garbageCollectionDeleteRemoteBranches || !pr.mergedAt) {
+			return;
+		}
+
+		try {
+			execFileSync("git", ["push", "origin", "--delete", branch], {
+				cwd: repositoryPath,
+				stdio: "pipe",
+				timeout: 30_000,
+			});
+			summary.removedRemoteBranches++;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			summary.errors.push(
+				`Failed to delete remote branch ${branch}: ${message}`,
+			);
+		}
+	}
+
+	private isProtectedIssueIdentifier(
+		issueIdentifier: string,
+		protection: GarbageCollectionProtection,
+	): boolean {
+		return protection.issueIdentifiers.has(issueIdentifier.toLowerCase());
+	}
+
+	private isProtectedBranch(
+		branch: string,
+		protection: GarbageCollectionProtection,
+	): boolean {
+		const normalizedBranch = branch.toLowerCase();
+		if (protection.branchNames.has(normalizedBranch)) {
+			return true;
+		}
+
+		const issueIdentifier = this.extractLinearIssueIdentifierFromText(branch);
+		return issueIdentifier
+			? protection.issueIdentifiers.has(issueIdentifier.toLowerCase())
+			: false;
+	}
+
+	private isCyrusGarbageCollectionBranch(
+		branch: string,
+		_issueIdentifier?: string,
+	): boolean {
+		const normalizedBranch = branch.toLowerCase();
+		return this.getCyrusGitHubPrBranchPrefixes().some((prefix) =>
+			normalizedBranch.startsWith(prefix.toLowerCase()),
+		);
 	}
 
 	private checkOperationalHealth(): void {
@@ -4116,6 +4653,10 @@ ${taskSection}`;
 		if (this.operationalMonitorTimer) {
 			clearInterval(this.operationalMonitorTimer);
 			this.operationalMonitorTimer = null;
+		}
+		if (this.garbageCollectionTimer) {
+			clearInterval(this.garbageCollectionTimer);
+			this.garbageCollectionTimer = null;
 		}
 
 		// Stop config file watcher

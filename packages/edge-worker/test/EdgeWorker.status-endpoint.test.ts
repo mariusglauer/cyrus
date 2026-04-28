@@ -428,6 +428,47 @@ describe("EdgeWorker - Status Endpoint", () => {
 		});
 	});
 
+	describe("garbage collection", () => {
+		it("only treats Cyrus-prefixed branches as GC candidates", () => {
+			edgeWorker = new EdgeWorker(mockConfig);
+
+			expect(
+				(edgeWorker as any).isCyrusGarbageCollectionBranch(
+					"cyrus2/fc-4410-pagebuilder-tags-not-readable",
+				),
+			).toBe(true);
+			expect(
+				(edgeWorker as any).isCyrusGarbageCollectionBranch(
+					"FC-4410-followup-funnel-mails",
+				),
+			).toBe(false);
+		});
+
+		it("only considers terminal PRs eligible after the GC grace window", () => {
+			edgeWorker = new EdgeWorker(mockConfig);
+			const oldDate = new Date(Date.now() - 2 * 60 * 60 * 1_000).toISOString();
+			const recentDate = new Date(Date.now()).toISOString();
+
+			expect(
+				(edgeWorker as any).isTerminalPullRequestEligibleForGarbageCollection({
+					state: "OPEN",
+				}),
+			).toBe(false);
+			expect(
+				(edgeWorker as any).isTerminalPullRequestEligibleForGarbageCollection({
+					state: "MERGED",
+					mergedAt: oldDate,
+				}),
+			).toBe(true);
+			expect(
+				(edgeWorker as any).isTerminalPullRequestEligibleForGarbageCollection({
+					state: "CLOSED",
+					closedAt: recentDate,
+				}),
+			).toBe(false);
+		});
+	});
+
 	describe("registerStatusEndpoint", () => {
 		it("should register GET /status endpoint with Fastify", async () => {
 			const mockGet = vi.fn();

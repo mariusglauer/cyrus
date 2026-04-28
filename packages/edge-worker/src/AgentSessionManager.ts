@@ -2744,8 +2744,9 @@ export class AgentSessionManager extends EventEmitter {
 	/**
 	 * Clear completed sessions older than specified time
 	 */
-	cleanup(olderThanMs: number = 24 * 60 * 60 * 1000): void {
+	cleanup(olderThanMs: number = 24 * 60 * 60 * 1000): number {
 		const cutoff = Date.now() - olderThanMs;
+		let removedCount = 0;
 
 		for (const [sessionId, session] of this.sessions.entries()) {
 			if (
@@ -2753,11 +2754,13 @@ export class AgentSessionManager extends EventEmitter {
 				session.updatedAt < cutoff
 			) {
 				const log = this.sessionLog(sessionId);
-				this.sessions.delete(sessionId);
-				this.entries.delete(sessionId);
+				this.removeSession(sessionId);
+				removedCount++;
 				log.debug(`Cleaned up session`);
 			}
 		}
+
+		return removedCount;
 	}
 
 	/**
