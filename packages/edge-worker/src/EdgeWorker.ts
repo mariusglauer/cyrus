@@ -96,6 +96,7 @@ import {
 	GitHubCommentService,
 	type GitHubCommentWebhookEvent,
 	GitHubEventTransport,
+	type GitHubPullRequest,
 	type GitHubPushPayload,
 	type GitHubWebhookEvent,
 	isCommentOnPullRequest,
@@ -2046,13 +2047,21 @@ export class EdgeWorker extends EventEmitter {
 		];
 
 		for (const candidate of candidates) {
-			const match = candidate.match(/\b[A-Z][A-Z0-9]+-\d+\b/);
-			if (match) {
-				return match[0];
+			const issueIdentifier =
+				this.extractLinearIssueIdentifierFromText(candidate);
+			if (issueIdentifier) {
+				return issueIdentifier;
 			}
 		}
 
 		return undefined;
+	}
+
+	private extractLinearIssueIdentifierFromText(
+		text: string,
+	): string | undefined {
+		const match = text.match(/\b[A-Z][A-Z0-9]+-\d+\b/);
+		return match?.[0];
 	}
 
 	private extractGitHubPullRequestBody(
@@ -2068,6 +2077,104 @@ export class EdgeWorker extends EventEmitter {
 			return event.payload.pull_request.body;
 		}
 		return null;
+	}
+
+	private shouldProcessGitHubChangeRequest(
+		event: GitHubCommentWebhookEvent,
+	): boolean {
+		if (!isPullRequestReviewPayload(event.payload)) {
+			return true;
+		}
+
+		if (event.payload.review.state !== "changes_requested") {
+			this.logger.debug(
+				`Ignoring pull_request_review with state: ${event.payload.review.state}`,
+			);
+			return false;
+		}
+
+		if (!this.isCyrusOwnedPullRequest(event.payload.pull_request)) {
+			this.logger.info(
+				`Ignoring pull_request_review on ${this.getGitHubWorkItemIdentifier(event)} because the pull request was not opened by Cyrus`,
+			);
+			return false;
+		}
+
+		return true;
+	}
+
+	private isCyrusOwnedPullRequest(pullRequest: GitHubPullRequest): boolean {
+		const authorLogin = pullRequest.user?.login?.toLowerCase();
+		const explicitAuthorLogins = this.parseCommaSeparatedEnvSet(
+			process.env.CYRUS_GITHUB_PR_AUTHOR_LOGINS,
+		);
+
+		if (explicitAuthorLogins.size > 0) {
+			return authorLogin ? explicitAuthorLogins.has(authorLogin) : false;
+		}
+
+		const botUsername = process.env.GITHUB_BOT_USERNAME?.trim().toLowerCase();
+		if (botUsername && authorLogin === botUsername) {
+			return true;
+		}
+
+		return this.hasCyrusPullRequestSignature(pullRequest);
+	}
+
+	private hasCyrusPullRequestSignature(
+		pullRequest: GitHubPullRequest,
+	): boolean {
+		const branchRef = pullRequest.head?.ref ?? "";
+		if (
+			this.getCyrusGitHubPrBranchPrefixes().some((prefix) =>
+				branchRef.startsWith(prefix),
+			)
+		) {
+			return true;
+		}
+
+		const title = pullRequest.title ?? "";
+		const body = pullRequest.body ?? "";
+		const issueIdentifier = this.extractLinearIssueIdentifierFromText(
+			`${title}\n${body}`,
+		);
+		if (!issueIdentifier) {
+			return false;
+		}
+
+		const normalizedIssue = issueIdentifier.toLowerCase();
+		if (!branchRef.toLowerCase().includes(normalizedIssue)) {
+			return false;
+		}
+
+		return (
+			title.toLowerCase().startsWith(`${normalizedIssue}:`) ||
+			body.toLowerCase().includes(`linear issue: ${normalizedIssue}`)
+		);
+	}
+
+	private getCyrusGitHubPrBranchPrefixes(): string[] {
+		const configuredPrefixes = this.parseCommaSeparatedEnvValues(
+			process.env.CYRUS_GITHUB_PR_BRANCH_PREFIXES,
+		);
+		return configuredPrefixes.length > 0
+			? configuredPrefixes
+			: ["cyrus/", "cyrus2/"];
+	}
+
+	private parseCommaSeparatedEnvSet(value: string | undefined): Set<string> {
+		return new Set(
+			this.parseCommaSeparatedEnvValues(value).map((item) =>
+				item.toLowerCase(),
+			),
+		);
+	}
+
+	private parseCommaSeparatedEnvValues(value: string | undefined): string[] {
+		return (value ?? "")
+			.split(",")
+			.map((item) => item.trim())
+			.filter(Boolean);
 	}
 
 	private async handleGitHubWebhook(
@@ -2100,15 +2207,13 @@ export class EdgeWorker extends EventEmitter {
 				return;
 			}
 
-			// For pull_request_review events, defensively check review state
+			// For pull_request_review events, defensively check review state and PR ownership
 			// (must happen before the mention check — reviews don't contain @mentions)
-			if (isPullRequestReviewPayload(event.payload)) {
-				if (event.payload.review.state !== "changes_requested") {
-					this.logger.debug(
-						`Ignoring pull_request_review with state: ${event.payload.review.state}`,
-					);
-					return;
-				}
+			if (
+				isPullRequestReviewPayload(event.payload) &&
+				!this.shouldProcessGitHubChangeRequest(event)
+			) {
+				return;
 			}
 
 			// Honor the PR-review trigger toggle: when disabled, ignore
@@ -5764,13 +5869,7 @@ ${taskSection}`;
 		}
 
 		if (isPullRequestReviewPayload(event.payload)) {
-			if (event.payload.review.state !== "changes_requested") {
-				this.logger.debug(
-					`Ignoring pull_request_review with state: ${event.payload.review.state}`,
-				);
-				return false;
-			}
-			return true;
+			return this.shouldProcessGitHubChangeRequest(event);
 		}
 
 		if (botUsername && !extractCommentBody(event).includes(`@${botUsername}`)) {

@@ -60,6 +60,9 @@ vi.mock("chokidar", () => ({
 describe("EdgeWorker - GitHub review comments", () => {
 	let edgeWorker: EdgeWorker;
 	let mockConfig: EdgeWorkerConfig;
+	let originalGitHubPrAuthorLogins: string | undefined;
+	let originalGitHubPrBranchPrefixes: string | undefined;
+	let originalGitHubBotUsername: string | undefined;
 
 	const mockRepository: RepositoryConfig = {
 		id: "test-repo",
@@ -102,6 +105,11 @@ describe("EdgeWorker - GitHub review comments", () => {
 
 	beforeEach(() => {
 		vi.clearAllMocks();
+		originalGitHubPrAuthorLogins = process.env.CYRUS_GITHUB_PR_AUTHOR_LOGINS;
+		originalGitHubPrBranchPrefixes =
+			process.env.CYRUS_GITHUB_PR_BRANCH_PREFIXES;
+		originalGitHubBotUsername = process.env.GITHUB_BOT_USERNAME;
+
 		mockConfig = {
 			platform: "linear",
 			cyrusHome: "/test/.cyrus",
@@ -116,6 +124,15 @@ describe("EdgeWorker - GitHub review comments", () => {
 
 	afterEach(async () => {
 		vi.unstubAllGlobals();
+		restoreEnvValue(
+			"CYRUS_GITHUB_PR_AUTHOR_LOGINS",
+			originalGitHubPrAuthorLogins,
+		);
+		restoreEnvValue(
+			"CYRUS_GITHUB_PR_BRANCH_PREFIXES",
+			originalGitHubPrBranchPrefixes,
+		);
+		restoreEnvValue("GITHUB_BOT_USERNAME", originalGitHubBotUsername);
 		if (edgeWorker) {
 			try {
 				await edgeWorker.stop();
@@ -123,6 +140,27 @@ describe("EdgeWorker - GitHub review comments", () => {
 				// Ignore cleanup errors
 			}
 		}
+	});
+
+	const restoreEnvValue = (name: string, value: string | undefined) => {
+		if (value === undefined) {
+			delete process.env[name];
+			return;
+		}
+		process.env[name] = value;
+	};
+
+	const withPullRequest = (overrides: Record<string, unknown>) => ({
+		...reviewEvent,
+		payload: {
+			...reviewEvent.payload,
+			pull_request: {
+				...reviewEvent.payload.pull_request,
+				body: null,
+				user: { login: "funnelcockpit-bot" },
+				...overrides,
+			},
+		},
 	});
 
 	it("adds inline review comments to change request instructions", async () => {
@@ -236,6 +274,44 @@ describe("EdgeWorker - GitHub review comments", () => {
 		const graphBody = JSON.parse(fetchMock.mock.calls[1][1].body);
 		expect(graphBody.query).toContain("markPullRequestReadyForReview");
 		expect(graphBody.variables).toEqual({ id: "PR_kwDOExample" });
+	});
+
+	it("allows change requests for configured Cyrus PR authors", () => {
+		process.env.CYRUS_GITHUB_PR_AUTHOR_LOGINS = "funnelcockpit-bot";
+
+		const event = withPullRequest({
+			user: { login: "funnelcockpit-bot" },
+			head: { ref: "fix/checkout" },
+		});
+
+		expect((edgeWorker as any).isQueueableGitHubEvent(event)).toBe(true);
+	});
+
+	it("ignores change requests on PRs not opened by Cyrus", () => {
+		process.env.CYRUS_GITHUB_PR_AUTHOR_LOGINS = "funnelcockpit-bot";
+
+		const event = withPullRequest({
+			title: "FC-4172: Fix checkout",
+			body: "Linear issue: FC-4172",
+			head: { ref: "cyrus2/fc-4172-checkout" },
+			user: { login: "human-dev" },
+		});
+
+		expect((edgeWorker as any).isQueueableGitHubEvent(event)).toBe(false);
+	});
+
+	it("recognizes Cyrus PR signatures when no PR author allowlist is configured", () => {
+		delete process.env.CYRUS_GITHUB_PR_AUTHOR_LOGINS;
+		delete process.env.GITHUB_BOT_USERNAME;
+
+		const event = withPullRequest({
+			title: "FC-4172: Fix checkout",
+			body: "Linear issue: FC-4172",
+			head: { ref: "cyrus2/fc-4172-checkout" },
+			user: { login: "automation-user" },
+		});
+
+		expect((edgeWorker as any).isQueueableGitHubEvent(event)).toBe(true);
 	});
 
 	it("resolves the original Linear agent session for a GitHub follow-up", () => {

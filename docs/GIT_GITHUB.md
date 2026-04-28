@@ -96,5 +96,7 @@ gh auth status
 
 - **Use a dedicated account** for Cyrus if you want to limit its access
 - **Repository access** is determined by your SSH key and GitHub token permissions
+- **Change-request follow-ups** should be limited to Cyrus-created PRs by setting
+  `CYRUS_GITHUB_PR_AUTHOR_LOGINS` to the GitHub login(s) Cyrus uses for PR creation
 - **Review permissions** before adding repositories to Cyrus
 - **Audit commits** - Cyrus-authored PRs include a `<!-- generated-by-cyrus -->` marker for traceability
