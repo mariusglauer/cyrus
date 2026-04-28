@@ -84,7 +84,15 @@ Spans multiple repositories
 
 <linear_comments>
 No comments yet.
-</linear_comments>`)
+</linear_comments>
+
+<frontend_screenshot_requirement>
+If you changed frontend/UI code and the app can reasonably be rendered locally, capture at least one fresh screenshot before your final response.
+Save the screenshot under \`cyrus-screenshots/\` or another workspace path containing \`screenshot\`, and leave it uncommitted so Cyrus can attach it to the GitHub PR.
+If no browser MCP/tool is available, use shell Playwright instead, for example: \`mkdir -p cyrus-screenshots && npx -y playwright@latest screenshot --browser chromium <local-url> cyrus-screenshots/frontend-after.png\`
+If you cannot capture a meaningful screenshot because the app cannot be run, requires unavailable auth/data, or there is no visual surface to render, state that exact reason in your final response.
+</frontend_screenshot_requirement>
+`)
 				.expectPromptType("fallback")
 				.expectComponents("issue-context")
 				.verify();
@@ -172,7 +180,15 @@ Tests worktree paths
 
 <linear_comments>
 No comments yet.
-</linear_comments>`)
+</linear_comments>
+
+<frontend_screenshot_requirement>
+If you changed frontend/UI code and the app can reasonably be rendered locally, capture at least one fresh screenshot before your final response.
+Save the screenshot under \`cyrus-screenshots/\` or another workspace path containing \`screenshot\`, and leave it uncommitted so Cyrus can attach it to the GitHub PR.
+If no browser MCP/tool is available, use shell Playwright instead, for example: \`mkdir -p cyrus-screenshots && npx -y playwright@latest screenshot --browser chromium <local-url> cyrus-screenshots/frontend-after.png\`
+If you cannot capture a meaningful screenshot because the app cannot be run, requires unavailable auth/data, or there is no visual surface to render, state that exact reason in your final response.
+</frontend_screenshot_requirement>
+`)
 				.expectPromptType("fallback")
 				.expectComponents("issue-context")
 				.verify();
@@ -239,7 +255,15 @@ Tests single-repo worktree path
 
 <linear_comments>
 No comments yet.
-</linear_comments>`)
+</linear_comments>
+
+<frontend_screenshot_requirement>
+If you changed frontend/UI code and the app can reasonably be rendered locally, capture at least one fresh screenshot before your final response.
+Save the screenshot under \`cyrus-screenshots/\` or another workspace path containing \`screenshot\`, and leave it uncommitted so Cyrus can attach it to the GitHub PR.
+If no browser MCP/tool is available, use shell Playwright instead, for example: \`mkdir -p cyrus-screenshots && npx -y playwright@latest screenshot --browser chromium <local-url> cyrus-screenshots/frontend-after.png\`
+If you cannot capture a meaningful screenshot because the app cannot be run, requires unavailable auth/data, or there is no visual surface to render, state that exact reason in your final response.
+</frontend_screenshot_requirement>
+`)
 				.expectPromptType("fallback")
 				.expectComponents("issue-context")
 				.verify();
@@ -307,7 +331,15 @@ Single repo description
 
 <linear_comments>
 No comments yet.
-</linear_comments>`)
+</linear_comments>
+
+<frontend_screenshot_requirement>
+If you changed frontend/UI code and the app can reasonably be rendered locally, capture at least one fresh screenshot before your final response.
+Save the screenshot under \`cyrus-screenshots/\` or another workspace path containing \`screenshot\`, and leave it uncommitted so Cyrus can attach it to the GitHub PR.
+If no browser MCP/tool is available, use shell Playwright instead, for example: \`mkdir -p cyrus-screenshots && npx -y playwright@latest screenshot --browser chromium <local-url> cyrus-screenshots/frontend-after.png\`
+If you cannot capture a meaningful screenshot because the app cannot be run, requires unavailable auth/data, or there is no visual surface to render, state that exact reason in your final response.
+</frontend_screenshot_requirement>
+`)
 				.expectPromptType("fallback")
 				.expectComponents("issue-context")
 				.verify();
@@ -518,6 +550,14 @@ Testing comment with multi-repo
 <linear_comments>
 No comments yet.
 </linear_comments>
+
+<frontend_screenshot_requirement>
+If you changed frontend/UI code and the app can reasonably be rendered locally, capture at least one fresh screenshot before your final response.
+Save the screenshot under \`cyrus-screenshots/\` or another workspace path containing \`screenshot\`, and leave it uncommitted so Cyrus can attach it to the GitHub PR.
+If no browser MCP/tool is available, use shell Playwright instead, for example: \`mkdir -p cyrus-screenshots && npx -y playwright@latest screenshot --browser chromium <local-url> cyrus-screenshots/frontend-after.png\`
+If you cannot capture a meaningful screenshot because the app cannot be run, requires unavailable auth/data, or there is no visual surface to render, state that exact reason in your final response.
+</frontend_screenshot_requirement>
+
 
 <user_comment>
 Please update both services
