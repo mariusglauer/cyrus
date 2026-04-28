@@ -38,6 +38,7 @@ vi.mock("../src/AgentSessionManager.js", () => ({
 			getAllSessions: vi.fn().mockReturnValue([]),
 			createCyrusAgentSession: vi.fn(),
 			getSession: vi.fn(),
+			getActiveSessions: vi.fn().mockReturnValue([]),
 			getActiveSessionsByIssueId: vi.fn().mockReturnValue([]),
 			setActivitySink: vi.fn(),
 			on: vi.fn(), // EventEmitter method
@@ -108,6 +109,7 @@ describe("EdgeWorker - Status Endpoint", () => {
 	});
 
 	afterEach(async () => {
+		vi.useRealTimers();
 		if (edgeWorker) {
 			try {
 				await edgeWorker.stop();
@@ -264,6 +266,132 @@ describe("EdgeWorker - Status Endpoint", () => {
 
 			// Count should still be 0 after error (finally block executed)
 			expect((edgeWorker as any).activeWebhookCount).toBe(0);
+		});
+	});
+
+	describe("durable queue recovery", () => {
+		it("requeues restored active Linear sessions that no longer have a runner", async () => {
+			edgeWorker = new EdgeWorker(mockConfig);
+			(edgeWorker as any).saveLinearSessionQueue = vi
+				.fn()
+				.mockResolvedValue(undefined);
+			(edgeWorker as any).sendOperationalAlert = vi
+				.fn()
+				.mockResolvedValue(undefined);
+
+			(edgeWorker as any).agentSessionManager.getActiveSessions = vi
+				.fn()
+				.mockReturnValue([
+					{
+						id: "linear-session-1",
+						externalSessionId: "linear-session-1",
+						status: "active",
+						issueContext: {
+							trackerId: "linear",
+							issueId: "issue-1",
+							issueIdentifier: "FC-4410",
+						},
+						issue: {
+							id: "issue-1",
+							identifier: "FC-4410",
+							title: "PageBuilder: Tags not readable",
+						},
+						repositories: [{ repositoryId: "test-repo" }],
+					},
+				]);
+
+			await (
+				edgeWorker as any
+			).recoverInterruptedActiveLinearSessionsFromState();
+
+			expect((edgeWorker as any).linearSessionQueue).toHaveLength(1);
+			expect((edgeWorker as any).linearSessionQueue[0]).toEqual(
+				expect.objectContaining({
+					origin: "linear",
+					sessionId: "linear-session-1",
+					workItemIdentifier: "FC-4410",
+					retryCount: 1,
+					lastError: "Recovered active session after Cyrus restart.",
+				}),
+			);
+			expect(
+				(edgeWorker as any).linearSessionQueue[0].webhook.organizationId,
+			).toBe("test-workspace");
+		});
+
+		it("does not duplicate sessions already tracked by the durable queue", async () => {
+			edgeWorker = new EdgeWorker(mockConfig);
+			(edgeWorker as any).saveLinearSessionQueue = vi
+				.fn()
+				.mockResolvedValue(undefined);
+			(edgeWorker as any).linearSessionQueue = [
+				{
+					origin: "linear",
+					sessionId: "linear-session-1",
+					workItemIdentifier: "FC-4410",
+					queuedAt: Date.now(),
+					availableAt: Date.now(),
+					retryCount: 0,
+					repoIds: ["test-repo"],
+					webhook: {
+						organizationId: "test-workspace",
+						agentSession: {
+							id: "linear-session-1",
+							issue: { id: "issue-1", identifier: "FC-4410" },
+						},
+					},
+				},
+			];
+			(edgeWorker as any).agentSessionManager.getActiveSessions = vi
+				.fn()
+				.mockReturnValue([
+					{
+						id: "linear-session-1",
+						externalSessionId: "linear-session-1",
+						status: "active",
+						issueContext: {
+							trackerId: "linear",
+							issueId: "issue-1",
+							issueIdentifier: "FC-4410",
+						},
+						issue: { id: "issue-1", identifier: "FC-4410" },
+						repositories: [{ repositoryId: "test-repo" }],
+					},
+				]);
+
+			await (
+				edgeWorker as any
+			).recoverInterruptedActiveLinearSessionsFromState();
+
+			expect((edgeWorker as any).linearSessionQueue).toHaveLength(1);
+		});
+
+		it("keeps a queued Linear item active until the agent session completes", async () => {
+			vi.useFakeTimers();
+			edgeWorker = new EdgeWorker(mockConfig);
+			let status = "active";
+			(edgeWorker as any).agentSessionManager.getSession = vi
+				.fn()
+				.mockImplementation(() => ({ status }));
+
+			let resolved = false;
+			const promise = (edgeWorker as any)
+				.waitForQueuedLinearSessionCompletion(
+					{ sessionId: "linear-session-1" },
+					new AbortController().signal,
+				)
+				.then(() => {
+					resolved = true;
+				});
+
+			await vi.advanceTimersByTimeAsync(1_000);
+			expect(resolved).toBe(false);
+
+			status = "complete";
+			await vi.advanceTimersByTimeAsync(1_000);
+			await promise;
+			expect(resolved).toBe(true);
+			vi.useRealTimers();
 		});
 	});
 

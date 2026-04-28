@@ -827,6 +827,7 @@ export class EdgeWorker extends EventEmitter {
 		await this.sharedApplicationServer.start();
 
 		await this.loadLinearSessionQueue();
+		await this.recoverInterruptedActiveLinearSessionsFromState();
 		this.drainLinearSessionQueue();
 		this.startOperationalMonitor();
 		void this.sendOperationalAlert({
@@ -5968,8 +5969,10 @@ ${taskSection}`;
 		item: AgentSessionQueueItem,
 	): Promise<void> {
 		let timeout: NodeJS.Timeout | undefined;
+		const abortController = new AbortController();
 		const timeoutPromise = new Promise<never>((_resolve, reject) => {
 			timeout = setTimeout(() => {
+				abortController.abort();
 				const error = new Error(
 					`${item.origin} agent session ${item.workItemIdentifier} timed out after ${Math.round(
 						this.linearSessionTimeoutMs / 60_000,
@@ -5984,12 +5987,17 @@ ${taskSection}`;
 			const workPromise =
 				item.origin === "github"
 					? this.runQueuedGitHubSession(item)
-					: this.runQueuedLinearSession(item);
+					: this.runQueuedLinearSession(item, abortController.signal);
+			void workPromise.catch(() => {
+				// Promise.race observes the first failure. If the watchdog wins, this
+				// prevents a later runner failure from surfacing as an unhandled rejection.
+			});
 			await Promise.race([workPromise, timeoutPromise]);
 		} catch (error) {
 			this.stopLinearSessionQueueItem(item);
 			throw error;
 		} finally {
+			abortController.abort();
 			if (timeout) {
 				clearTimeout(timeout);
 			}
@@ -5998,6 +6006,7 @@ ${taskSection}`;
 
 	private async runQueuedLinearSession(
 		item: AgentSessionQueueItem,
+		abortSignal: AbortSignal,
 	): Promise<void> {
 		if (!item.webhook) {
 			throw new Error(`Missing Linear webhook payload for ${item.sessionId}`);
@@ -6007,6 +6016,45 @@ ${taskSection}`;
 			item.webhook,
 			this.resolveLinearSessionQueueRepos(item),
 		);
+		await this.waitForQueuedLinearSessionCompletion(item, abortSignal);
+	}
+
+	private async waitForQueuedLinearSessionCompletion(
+		item: AgentSessionQueueItem,
+		abortSignal: AbortSignal,
+	): Promise<void> {
+		const session = this.agentSessionManager.getSession(item.sessionId);
+		if (!session || session.status !== "active") {
+			return;
+		}
+
+		await new Promise<void>((resolve) => {
+			let interval: NodeJS.Timeout | undefined;
+			const cleanup = () => {
+				if (interval) {
+					clearInterval(interval);
+					interval = undefined;
+				}
+				abortSignal.removeEventListener("abort", check);
+			};
+			const check = () => {
+				const currentSession = this.agentSessionManager.getSession(
+					item.sessionId,
+				);
+				if (
+					abortSignal.aborted ||
+					!currentSession ||
+					currentSession.status !== "active"
+				) {
+					cleanup();
+					resolve();
+				}
+			};
+
+			interval = setInterval(check, 1_000);
+			abortSignal.addEventListener("abort", check, { once: true });
+			check();
+		});
 	}
 
 	private async runQueuedGitHubSession(
@@ -6413,6 +6461,101 @@ ${taskSection}`;
 			);
 			this.linearSessionQueue = [];
 		}
+	}
+
+	private async recoverInterruptedActiveLinearSessionsFromState(): Promise<void> {
+		const now = Date.now();
+		const trackedSessionIds = new Set([
+			...this.linearSessionQueue.map((item) => item.sessionId),
+			...Array.from(this.linearSessionActiveItems.keys()),
+		]);
+		const recoveredItems: AgentSessionQueueItem[] = [];
+
+		for (const session of this.agentSessionManager.getActiveSessions()) {
+			const sessionId = session.externalSessionId ?? session.id;
+			if (
+				session.issueContext?.trackerId !== "linear" ||
+				session.agentRunner ||
+				trackedSessionIds.has(sessionId)
+			) {
+				continue;
+			}
+
+			const item = this.createRecoveredLinearSessionQueueItem(session, now);
+			if (!item) {
+				continue;
+			}
+
+			recoveredItems.push(item);
+			trackedSessionIds.add(item.sessionId);
+		}
+
+		if (recoveredItems.length === 0) {
+			return;
+		}
+
+		this.linearSessionQueue.push(...recoveredItems);
+		await this.saveLinearSessionQueue();
+		this.logger.warn(
+			`Recovered ${recoveredItems.length} interrupted Linear session(s) from persisted state`,
+		);
+		void this.sendOperationalAlert({
+			key: "linear-state-recovered-active",
+			severity: "warning",
+			title: "Recovered interrupted Linear sessions",
+			message: `${recoveredItems.length} active Linear session(s) had no live runner after restart and were returned to the durable queue.`,
+		});
+	}
+
+	private createRecoveredLinearSessionQueueItem(
+		session: CyrusAgentSession,
+		now: number,
+	): AgentSessionQueueItem | null {
+		const issue = session.issue;
+		const issueIdentifier =
+			session.issueContext?.issueIdentifier ?? issue?.identifier;
+		const issueId = session.issueContext?.issueId ?? issue?.id;
+		const sessionId = session.externalSessionId ?? session.id;
+		const linearWorkspaceId = this.resolveLinearWorkspaceIdForSession(session);
+
+		if (!issue || !issueIdentifier || !issueId || !linearWorkspaceId) {
+			this.logger.warn(
+				`Cannot recover interrupted Linear session ${sessionId}: missing issue or workspace context`,
+			);
+			return null;
+		}
+
+		const repoIds = session.repositories
+			.map((repoContext) => repoContext.repositoryId)
+			.filter((repoId) => this.repositories.has(repoId));
+
+		return {
+			origin: "linear",
+			webhook: {
+				action: "created",
+				type: "AgentSession",
+				organizationId: linearWorkspaceId,
+				appUserId: "",
+				oauthClientId: "",
+				createdAt: new Date(now).toISOString(),
+				agentSession: {
+					id: sessionId,
+					issue: {
+						...issue,
+						id: issueId,
+						identifier: issueIdentifier,
+					},
+				},
+			} as unknown as AgentSessionCreatedWebhook,
+			repoIds,
+			workItemIdentifier: issueIdentifier,
+			sessionId,
+			queuedAt: now,
+			availableAt: now,
+			retryCount: 1,
+			lastError: "Recovered active session after Cyrus restart.",
+			recoveredAt: now,
+		};
 	}
 
 	private async saveLinearSessionQueue(): Promise<void> {
