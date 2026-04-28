@@ -237,4 +237,48 @@ describe("EdgeWorker - GitHub review comments", () => {
 		expect(graphBody.query).toContain("markPullRequestReadyForReview");
 		expect(graphBody.variables).toEqual({ id: "PR_kwDOExample" });
 	});
+
+	it("resolves the original Linear agent session for a GitHub follow-up", () => {
+		(edgeWorker as any).agentSessionManager.getAllSessions = vi
+			.fn()
+			.mockReturnValue([
+				{
+					id: "linear-session-1",
+					externalSessionId: "linear-session-1",
+					updatedAt: 10,
+					issueContext: {
+						trackerId: "linear",
+						issueIdentifier: "FC-4172",
+					},
+					issue: {
+						identifier: "FC-4172",
+					},
+					repositories: [{ repositoryId: "test-repo" }],
+				},
+			]);
+
+		const event = {
+			...reviewEvent,
+			payload: {
+				...reviewEvent.payload,
+				pull_request: {
+					...reviewEvent.payload.pull_request,
+					title: "FC-4172: Fix checkout",
+					body: "Linear issue: FC-4172",
+				},
+			},
+		};
+
+		const link = (edgeWorker as any).resolveLinearSessionLinkForGitHubEvent(
+			event,
+			mockRepository,
+			"fix/fc-4172-checkout",
+		);
+
+		expect(link).toEqual({
+			sessionId: "linear-session-1",
+			workspaceId: "test-workspace",
+			issueIdentifier: "FC-4172",
+		});
+	});
 });

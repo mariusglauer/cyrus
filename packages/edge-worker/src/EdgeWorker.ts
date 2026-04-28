@@ -200,10 +200,11 @@ type RateLimitHeaders =
 	| Record<string, string | number | undefined>
 	| { get(name: string): string | null };
 
-type LinearSessionQueueItem = {
-	webhook: AgentSessionCreatedWebhook;
-	repoIds: string[];
-	issueIdentifier: string;
+type AgentSessionQueueOrigin = "linear" | "github";
+
+type AgentSessionQueueItem = {
+	origin: AgentSessionQueueOrigin;
+	workItemIdentifier: string;
 	sessionId: string;
 	queuedAt: number;
 	availableAt: number;
@@ -211,10 +212,20 @@ type LinearSessionQueueItem = {
 	lastError?: string;
 	startedAt?: number;
 	recoveredAt?: number;
+	webhook?: AgentSessionCreatedWebhook;
+	repoIds?: string[];
+	githubEvent?: GitHubCommentWebhookEvent;
+	githubRepositoryId?: string;
 };
 
-type SerializedLinearSessionQueueItem = LinearSessionQueueItem & {
+type SerializedAgentSessionQueueItem = AgentSessionQueueItem & {
 	state?: "queued" | "running";
+	/** @deprecated Older queue files used issueIdentifier for Linear-only items. */
+	issueIdentifier?: string;
+	/** @deprecated Older queue files stored Linear payloads without origin. */
+	webhook?: AgentSessionCreatedWebhook;
+	/** @deprecated Older queue files stored repo IDs as a top-level field. */
+	repoIds?: string[];
 };
 
 type OperationalAlertSeverity = "info" | "warning" | "error";
@@ -227,6 +238,12 @@ type OperationalAlert = {
 	createdAt: number;
 	lastSentAt?: number;
 	sendCount: number;
+};
+
+type LinearSessionLink = {
+	sessionId: string;
+	workspaceId: string;
+	issueIdentifier: string;
 };
 
 /**
@@ -264,8 +281,8 @@ export class EdgeWorker extends EventEmitter {
 	public repositoryRouter: RepositoryRouter; // Repository routing and selection
 	private gitService: GitService;
 	private activeWebhookCount = 0; // Track number of webhooks currently being processed
-	private linearSessionQueue: LinearSessionQueueItem[] = [];
-	private linearSessionActiveItems: Map<string, LinearSessionQueueItem> =
+	private linearSessionQueue: AgentSessionQueueItem[] = [];
+	private linearSessionActiveItems: Map<string, AgentSessionQueueItem> =
 		new Map();
 	private linearSessionQueueFile: string;
 	private linearSessionQueueDrainTimer: NodeJS.Timeout | null = null;
@@ -1003,9 +1020,14 @@ export class EdgeWorker extends EventEmitter {
 			return reply.status(200).send(this.buildLinearQueueStatus());
 		});
 
+		fastify.get("/agent-queue", async (_request, reply) => {
+			return reply.status(200).send(this.buildLinearQueueStatus());
+		});
+
 		this.logger.info("✅ Status endpoint registered");
 		this.logger.info("   Route: GET /status");
 		this.logger.info("   Route: GET /linear-queue");
+		this.logger.info("   Route: GET /agent-queue");
 	}
 
 	private renderDashboardHtml(): string {
@@ -1351,6 +1373,7 @@ export class EdgeWorker extends EventEmitter {
 				els.activeTasks,
 				createTable(
 					[
+						{ label: "Origin", value: (row) => row.origin },
 						{ label: "Issue", value: (row) => row.issueIdentifier, code: true },
 						{ label: "Session", value: (row) => row.sessionId, code: true },
 						{ label: "Retry", value: (row) => row.retryCount },
@@ -1368,6 +1391,7 @@ export class EdgeWorker extends EventEmitter {
 				createTable(
 					[
 						{ label: "#", value: (row) => row.position },
+						{ label: "Origin", value: (row) => row.origin },
 						{ label: "Issue", value: (row) => row.issueIdentifier, code: true },
 						{ label: "Session", value: (row) => row.sessionId, code: true },
 						{ label: "Retry", value: (row) => row.retryCount },
@@ -1497,10 +1521,10 @@ export class EdgeWorker extends EventEmitter {
 				);
 				return;
 			}
-			this.handleGitHubWebhook(event as GitHubCommentWebhookEvent).catch(
+			this.enqueueGitHubAgentSession(event as GitHubCommentWebhookEvent).catch(
 				(error) => {
 					this.logger.error(
-						"Failed to handle GitHub webhook",
+						"Failed to enqueue GitHub webhook",
 						error instanceof Error ? error : new Error(String(error)),
 					);
 				},
@@ -1868,6 +1892,163 @@ export class EdgeWorker extends EventEmitter {
 		}
 	}
 
+	private async postGitHubIssueComment(
+		event: GitHubCommentWebhookEvent,
+		body: string,
+	): Promise<void> {
+		const prNumber = extractPRNumber(event);
+		if (!prNumber) {
+			return;
+		}
+
+		const token = await this.resolveGitHubToken(event);
+		if (!token) {
+			this.logger.warn(
+				`Cannot post GitHub queue status for ${this.getGitHubWorkItemIdentifier(event)}: no token configured`,
+			);
+			return;
+		}
+
+		try {
+			await this.gitHubCommentService.postIssueComment({
+				token,
+				owner: extractRepoOwner(event),
+				repo: extractRepoName(event),
+				issueNumber: prNumber,
+				body,
+			});
+		} catch (error) {
+			this.logger.warn(
+				`Failed to post GitHub queue status for ${this.getGitHubWorkItemIdentifier(event)}: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			);
+		}
+	}
+
+	private async postGitHubLinkedLinearThought(
+		event: GitHubCommentWebhookEvent,
+		repository: RepositoryConfig | null | undefined,
+		body: string,
+	): Promise<void> {
+		const link = this.resolveLinearSessionLinkForGitHubEvent(event, repository);
+		if (!link) {
+			return;
+		}
+
+		await this.activityPoster.postThoughtActivity(
+			link.sessionId,
+			link.workspaceId,
+			body,
+		);
+	}
+
+	private resolveLinearSessionLinkForGitHubEvent(
+		event: GitHubCommentWebhookEvent,
+		repository?: RepositoryConfig | null,
+		branchRef?: string | null,
+	): LinearSessionLink | null {
+		const issueIdentifier = this.extractLinearIssueIdentifierFromGitHubEvent(
+			event,
+			branchRef,
+		);
+		if (!issueIdentifier) {
+			return null;
+		}
+
+		const candidates = this.agentSessionManager
+			.getAllSessions()
+			.filter((session) => {
+				if (
+					session.issueContext?.trackerId !== "linear" ||
+					!session.externalSessionId
+				) {
+					return false;
+				}
+
+				const sessionIssueIdentifier =
+					session.issueContext.issueIdentifier ?? session.issue?.identifier;
+				if (sessionIssueIdentifier !== issueIdentifier) {
+					return false;
+				}
+
+				if (!repository) {
+					return true;
+				}
+
+				return session.repositories.some(
+					(repo) => repo.repositoryId === repository.id,
+				);
+			})
+			.sort((a, b) => b.updatedAt - a.updatedAt);
+
+		const session = candidates[0];
+		if (!session?.externalSessionId) {
+			return null;
+		}
+
+		const workspaceId =
+			repository?.linearWorkspaceId ??
+			this.resolveLinearWorkspaceIdForSession(session);
+		if (!workspaceId) {
+			return null;
+		}
+
+		return {
+			sessionId: session.externalSessionId,
+			workspaceId,
+			issueIdentifier,
+		};
+	}
+
+	private resolveLinearWorkspaceIdForSession(
+		session: CyrusAgentSession,
+	): string | undefined {
+		for (const repoContext of session.repositories) {
+			const repository = this.repositories.get(repoContext.repositoryId);
+			if (repository?.linearWorkspaceId) {
+				return repository.linearWorkspaceId;
+			}
+		}
+		return undefined;
+	}
+
+	private extractLinearIssueIdentifierFromGitHubEvent(
+		event: GitHubCommentWebhookEvent,
+		branchRef?: string | null,
+	): string | undefined {
+		const candidates = [
+			extractPRTitle(event) ?? "",
+			this.extractGitHubPullRequestBody(event) ?? "",
+			branchRef ?? extractPRBranchRef(event) ?? "",
+			extractCommentBody(event) ?? "",
+		];
+
+		for (const candidate of candidates) {
+			const match = candidate.match(/\b[A-Z][A-Z0-9]+-\d+\b/);
+			if (match) {
+				return match[0];
+			}
+		}
+
+		return undefined;
+	}
+
+	private extractGitHubPullRequestBody(
+		event: GitHubCommentWebhookEvent,
+	): string | null {
+		if (isIssueCommentPayload(event.payload)) {
+			return event.payload.issue.body;
+		}
+		if (
+			isPullRequestReviewPayload(event.payload) ||
+			isPullRequestReviewCommentPayload(event.payload)
+		) {
+			return event.payload.pull_request.body;
+		}
+		return null;
+	}
+
 	private async handleGitHubWebhook(
 		event: GitHubCommentWebhookEvent,
 	): Promise<void> {
@@ -2150,6 +2331,23 @@ export class EdgeWorker extends EventEmitter {
 					`Failed to create session for GitHub webhook ${event.deliveryId}`,
 				);
 				return;
+			}
+
+			const linearSessionLink = this.resolveLinearSessionLinkForGitHubEvent(
+				event,
+				repository,
+				branchRef,
+			);
+			if (linearSessionLink) {
+				session.externalSessionId = linearSessionLink.sessionId;
+				this.logger.info(
+					`Linked GitHub follow-up ${repoFullName}#${prNumber} to Linear agent session ${linearSessionLink.sessionId} (${linearSessionLink.issueIdentifier})`,
+				);
+				await this.activityPoster.postThoughtActivity(
+					linearSessionLink.sessionId,
+					linearSessionLink.workspaceId,
+					`GitHub follow-up started for ${repoFullName}#${prNumber}.`,
+				);
 			}
 
 			// Initialize session metadata
@@ -3364,11 +3562,13 @@ ${taskSection}`;
 	}
 
 	private buildStatusPayload() {
+		const agentQueue = this.buildLinearQueueStatus();
 		return {
 			status: this.computeStatus(),
 			activeWebhookCount: this.activeWebhookCount,
 			activeRunnerCount: this.getActiveRunnerCount(),
-			linearQueue: this.buildLinearQueueStatus(),
+			agentQueue,
+			linearQueue: agentQueue,
 			recentAlerts: this.operationalAlerts.slice(0, 10).map((alert) => ({
 				severity: alert.severity,
 				title: alert.title,
@@ -3414,8 +3614,9 @@ ${taskSection}`;
 			sessionTimeoutMs: this.linearSessionTimeoutMs,
 			activeItems: Array.from(this.linearSessionActiveItems.values()).map(
 				(item) => ({
+					origin: item.origin,
 					sessionId: item.sessionId,
-					issueIdentifier: item.issueIdentifier,
+					issueIdentifier: item.workItemIdentifier,
 					retryCount: item.retryCount,
 					queuedForMs: Math.max(0, now - item.queuedAt),
 					runningForMs: item.startedAt ? Math.max(0, now - item.startedAt) : 0,
@@ -3429,9 +3630,10 @@ ${taskSection}`;
 				}),
 			),
 			pendingItems: this.linearSessionQueue.map((item, index) => ({
+				origin: item.origin,
 				position: index + 1,
 				sessionId: item.sessionId,
-				issueIdentifier: item.issueIdentifier,
+				issueIdentifier: item.workItemIdentifier,
 				retryCount: item.retryCount,
 				queuedForMs: Math.max(0, now - item.queuedAt),
 				availableInMs: Math.max(0, item.availableAt - now),
@@ -3480,10 +3682,10 @@ ${taskSection}`;
 			const queuedForMs = Math.max(0, now - item.queuedAt);
 			if (queuedForMs >= this.queueWaitAlertMs) {
 				void this.sendOperationalAlert({
-					key: `linear-queue-wait:${item.sessionId}`,
+					key: `agent-queue-wait:${item.sessionId}`,
 					severity: "warning",
-					title: "Linear task waiting in queue",
-					message: `${item.issueIdentifier} has been queued for ${Math.round(
+					title: "Agent task waiting in queue",
+					message: `${item.workItemIdentifier} (${item.origin}) has been queued for ${Math.round(
 						queuedForMs / 60_000,
 					)} minutes.`,
 				});
@@ -3496,10 +3698,10 @@ ${taskSection}`;
 				: 0;
 			if (runningForMs >= this.activeTaskAlertMs) {
 				void this.sendOperationalAlert({
-					key: `linear-active-stuck:${item.sessionId}`,
+					key: `agent-active-stuck:${item.sessionId}`,
 					severity: "warning",
-					title: "Linear task running for a long time",
-					message: `${item.issueIdentifier} has been running for ${Math.round(
+					title: "Agent task running for a long time",
+					message: `${item.workItemIdentifier} (${item.origin}) has been running for ${Math.round(
 						runningForMs / 60_000,
 					)} minutes.`,
 				});
@@ -5342,10 +5544,11 @@ ${taskSection}`;
 		}
 
 		const now = Date.now();
-		const item: LinearSessionQueueItem = {
+		const item: AgentSessionQueueItem = {
+			origin: "linear",
 			webhook,
 			repoIds: repos.map((repo) => repo.id),
-			issueIdentifier,
+			workItemIdentifier: issueIdentifier,
 			sessionId,
 			queuedAt: now,
 			availableAt: now,
@@ -5361,10 +5564,101 @@ ${taskSection}`;
 			this.linearSessionCooldownUntil > now ||
 			this.linearSessionQueue.length > 1
 		) {
-			await this.postLinearQueueAcknowledgment(item, "queued");
+			await this.postAgentQueueAcknowledgment(item, "queued");
 		}
 
 		this.drainLinearSessionQueue();
+	}
+
+	private async enqueueGitHubAgentSession(
+		event: GitHubCommentWebhookEvent,
+	): Promise<void> {
+		if (!this.isQueueableGitHubEvent(event)) {
+			return;
+		}
+
+		const sessionId = `github-${event.deliveryId}`;
+		const workItemIdentifier = this.getGitHubWorkItemIdentifier(event);
+		if (
+			this.linearSessionActiveItems.has(sessionId) ||
+			this.linearSessionQueue.some((item) => item.sessionId === sessionId)
+		) {
+			this.logger.info(
+				`Skipping duplicate GitHub agent queue item for ${workItemIdentifier}`,
+			);
+			return;
+		}
+
+		const repository = this.findRepositoryByGitHubUrl(
+			extractRepoFullName(event),
+		);
+		const now = Date.now();
+		const item: AgentSessionQueueItem = {
+			origin: "github",
+			githubEvent: event,
+			githubRepositoryId: repository?.id,
+			workItemIdentifier,
+			sessionId,
+			queuedAt: now,
+			availableAt: now,
+			retryCount: 0,
+		};
+
+		this.linearSessionQueue.push(item);
+		await this.saveLinearSessionQueue();
+
+		if (
+			this.linearSessionActiveItems.size >=
+				this.linearSessionQueueConcurrency ||
+			this.linearSessionCooldownUntil > now ||
+			this.linearSessionQueue.length > 1
+		) {
+			await this.postAgentQueueAcknowledgment(item, "queued");
+		}
+
+		this.drainLinearSessionQueue();
+	}
+
+	private isQueueableGitHubEvent(event: GitHubCommentWebhookEvent): boolean {
+		if (!isCommentOnPullRequest(event)) {
+			this.logger.debug("Ignoring GitHub comment on non-PR issue");
+			return false;
+		}
+
+		const commentAuthor = extractCommentAuthor(event);
+		const botUsername = process.env.GITHUB_BOT_USERNAME;
+		if (botUsername && commentAuthor === botUsername) {
+			this.logger.debug(
+				`Ignoring comment from bot user @${botUsername} on ${this.getGitHubWorkItemIdentifier(event)}`,
+			);
+			return false;
+		}
+
+		if (isPullRequestReviewPayload(event.payload)) {
+			if (event.payload.review.state !== "changes_requested") {
+				this.logger.debug(
+					`Ignoring pull_request_review with state: ${event.payload.review.state}`,
+				);
+				return false;
+			}
+			return true;
+		}
+
+		if (botUsername && !extractCommentBody(event).includes(`@${botUsername}`)) {
+			this.logger.debug(
+				`Ignoring comment without @${botUsername} mention on ${this.getGitHubWorkItemIdentifier(event)}`,
+			);
+			return false;
+		}
+
+		return true;
+	}
+
+	private getGitHubWorkItemIdentifier(
+		event: GitHubCommentWebhookEvent,
+	): string {
+		const prNumber = extractPRNumber(event);
+		return `${extractRepoFullName(event)}#${prNumber ?? "unknown"}`;
 	}
 
 	private drainLinearSessionQueue(): void {
@@ -5416,22 +5710,22 @@ ${taskSection}`;
 	}
 
 	private async processLinearSessionQueueItem(
-		item: LinearSessionQueueItem,
+		item: AgentSessionQueueItem,
 	): Promise<void> {
 		try {
-			const canStart = await this.postLinearQueueAcknowledgment(
+			const canStart = await this.postAgentQueueAcknowledgment(
 				item,
 				"starting",
 			);
 			if (!canStart) {
 				await this.requeueOrFailLinearSessionItem(
 					item,
-					new Error("Linear rate limit while posting queue start"),
+					new Error("Rate limit while posting queue start"),
 					true,
 				);
 				return;
 			}
-			await this.runLinearSessionQueueItemWithWatchdog(item);
+			await this.runAgentSessionQueueItemWithWatchdog(item);
 		} catch (error) {
 			const isRateLimited = this.applyLinearRateLimitCooldown(error);
 			await this.requeueOrFailLinearSessionItem(item, error, isRateLimited);
@@ -5442,14 +5736,14 @@ ${taskSection}`;
 		}
 	}
 
-	private async runLinearSessionQueueItemWithWatchdog(
-		item: LinearSessionQueueItem,
+	private async runAgentSessionQueueItemWithWatchdog(
+		item: AgentSessionQueueItem,
 	): Promise<void> {
 		let timeout: NodeJS.Timeout | undefined;
 		const timeoutPromise = new Promise<never>((_resolve, reject) => {
 			timeout = setTimeout(() => {
 				const error = new Error(
-					`Linear agent session ${item.issueIdentifier} timed out after ${Math.round(
+					`${item.origin} agent session ${item.workItemIdentifier} timed out after ${Math.round(
 						this.linearSessionTimeoutMs / 60_000,
 					)} minutes`,
 				) as Error & { code?: string };
@@ -5459,13 +5753,11 @@ ${taskSection}`;
 		});
 
 		try {
-			await Promise.race([
-				this.handleAgentSessionCreatedWebhook(
-					item.webhook,
-					this.resolveLinearSessionQueueRepos(item),
-				),
-				timeoutPromise,
-			]);
+			const workPromise =
+				item.origin === "github"
+					? this.runQueuedGitHubSession(item)
+					: this.runQueuedLinearSession(item);
+			await Promise.race([workPromise, timeoutPromise]);
 		} catch (error) {
 			this.stopLinearSessionQueueItem(item);
 			throw error;
@@ -5476,10 +5768,33 @@ ${taskSection}`;
 		}
 	}
 
+	private async runQueuedLinearSession(
+		item: AgentSessionQueueItem,
+	): Promise<void> {
+		if (!item.webhook) {
+			throw new Error(`Missing Linear webhook payload for ${item.sessionId}`);
+		}
+
+		await this.handleAgentSessionCreatedWebhook(
+			item.webhook,
+			this.resolveLinearSessionQueueRepos(item),
+		);
+	}
+
+	private async runQueuedGitHubSession(
+		item: AgentSessionQueueItem,
+	): Promise<void> {
+		if (!item.githubEvent) {
+			throw new Error(`Missing GitHub webhook payload for ${item.sessionId}`);
+		}
+
+		await this.handleGitHubWebhook(item.githubEvent);
+	}
+
 	private resolveLinearSessionQueueRepos(
-		item: LinearSessionQueueItem,
+		item: AgentSessionQueueItem,
 	): RepositoryConfig[] {
-		const repos = item.repoIds
+		const repos = (item.repoIds ?? [])
 			.map((repoId) => this.repositories.get(repoId))
 			.filter((repo): repo is RepositoryConfig => Boolean(repo));
 
@@ -5492,14 +5807,14 @@ ${taskSection}`;
 		);
 		if (fallbackRepos.length === 0) {
 			throw new Error(
-				`No active repositories available for ${item.issueIdentifier}`,
+				`No active repositories available for ${item.workItemIdentifier}`,
 			);
 		}
 
 		return fallbackRepos;
 	}
 
-	private stopLinearSessionQueueItem(item: LinearSessionQueueItem): void {
+	private stopLinearSessionQueueItem(item: AgentSessionQueueItem): void {
 		const session = this.agentSessionManager.getSession(item.sessionId);
 		if (!session) {
 			return;
@@ -5510,7 +5825,7 @@ ${taskSection}`;
 	}
 
 	private async requeueOrFailLinearSessionItem(
-		item: LinearSessionQueueItem,
+		item: AgentSessionQueueItem,
 		error: unknown,
 		isRateLimited: boolean,
 	): Promise<void> {
@@ -5519,18 +5834,18 @@ ${taskSection}`;
 
 		if (nextRetryCount > this.linearSessionMaxRetries) {
 			this.logger.error(
-				`Linear agent session ${item.issueIdentifier} failed after ${item.retryCount} retries: ${errorMessage}`,
+				`${item.origin} agent session ${item.workItemIdentifier} failed after ${item.retryCount} retries: ${errorMessage}`,
 			);
 			void this.sendOperationalAlert({
-				key: `linear-session-failed:${item.sessionId}`,
+				key: `agent-session-failed:${item.sessionId}`,
 				severity: "error",
-				title: "Linear task failed",
-				message: `${item.issueIdentifier} failed after ${
+				title: "Agent task failed",
+				message: `${item.workItemIdentifier} (${item.origin}) failed after ${
 					this.linearSessionMaxRetries + 1
 				} attempt(s): ${errorMessage}`,
 			});
 			if (!isRateLimited) {
-				await this.postLinearQueueFailure(item, errorMessage);
+				await this.postAgentQueueFailure(item, errorMessage);
 			}
 			return;
 		}
@@ -5551,20 +5866,36 @@ ${taskSection}`;
 		});
 
 		this.logger.warn(
-			`Re-queued ${item.issueIdentifier} after failure (retry ${nextRetryCount}/${this.linearSessionMaxRetries})`,
+			`Re-queued ${item.workItemIdentifier} after failure (retry ${nextRetryCount}/${this.linearSessionMaxRetries})`,
 		);
 	}
 
-	private async postLinearQueueAcknowledgment(
-		item: LinearSessionQueueItem,
+	private async postAgentQueueAcknowledgment(
+		item: AgentSessionQueueItem,
 		state: "queued" | "starting",
 	): Promise<boolean> {
+		if (item.origin === "github") {
+			await this.postGitHubQueueAcknowledgment(item, state);
+			return true;
+		}
+
+		return this.postLinearQueueAcknowledgment(item, state);
+	}
+
+	private async postLinearQueueAcknowledgment(
+		item: AgentSessionQueueItem,
+		state: "queued" | "starting",
+	): Promise<boolean> {
+		if (!item.webhook) {
+			return true;
+		}
+
 		try {
 			const waitingCount = this.linearSessionQueue.length;
 			const body =
 				state === "starting"
-					? `Starting ${item.issueIdentifier}.`
-					: `Queued ${item.issueIdentifier}. Cyrus is already running ${this.linearSessionActiveItems.size} task(s); ${waitingCount} task(s) are waiting.`;
+					? `Starting ${item.workItemIdentifier}.`
+					: `Queued ${item.workItemIdentifier}. Cyrus is already running ${this.linearSessionActiveItems.size} task(s); ${waitingCount} task(s) are waiting.`;
 
 			await this.activityPoster.postThoughtActivity(
 				item.sessionId,
@@ -5575,28 +5906,94 @@ ${taskSection}`;
 		} catch (error) {
 			const isRateLimited = this.applyLinearRateLimitCooldown(error);
 			this.logger.warn(
-				`Failed to post Linear queue acknowledgment for ${item.issueIdentifier}: ${this.formatLinearQueueError(error)}`,
+				`Failed to post Linear queue acknowledgment for ${item.workItemIdentifier}: ${this.formatLinearQueueError(error)}`,
 			);
 			return !isRateLimited;
 		}
 	}
 
-	private async postLinearQueueFailure(
-		item: LinearSessionQueueItem,
+	private async postGitHubQueueAcknowledgment(
+		item: AgentSessionQueueItem,
+		state: "queued" | "starting",
+	): Promise<void> {
+		if (!item.githubEvent) {
+			return;
+		}
+
+		const waitingCount = this.linearSessionQueue.length;
+		const body =
+			state === "starting"
+				? `Starting GitHub follow-up for ${item.workItemIdentifier}.`
+				: `Queued GitHub follow-up for ${item.workItemIdentifier}. Cyrus is already running ${this.linearSessionActiveItems.size} task(s); ${waitingCount} task(s) are waiting.`;
+
+		const repository = item.githubRepositoryId
+			? this.repositories.get(item.githubRepositoryId)
+			: null;
+		await this.postGitHubLinkedLinearThought(
+			item.githubEvent,
+			repository,
+			body,
+		);
+
+		if (state === "queued") {
+			await this.postGitHubIssueComment(item.githubEvent, body);
+		}
+	}
+
+	private async postAgentQueueFailure(
+		item: AgentSessionQueueItem,
 		errorMessage: string,
 	): Promise<void> {
+		if (item.origin === "github") {
+			await this.postGitHubQueueFailure(item, errorMessage);
+			return;
+		}
+
+		await this.postLinearQueueFailure(item, errorMessage);
+	}
+
+	private async postLinearQueueFailure(
+		item: AgentSessionQueueItem,
+		errorMessage: string,
+	): Promise<void> {
+		if (!item.webhook) {
+			return;
+		}
+
 		try {
 			await this.activityPoster.postThoughtActivity(
 				item.sessionId,
 				item.webhook.organizationId,
-				`Cyrus could not start ${item.issueIdentifier} after ${this.linearSessionMaxRetries + 1} attempt(s). Last error: ${errorMessage}`,
+				`Cyrus could not start ${item.workItemIdentifier} after ${this.linearSessionMaxRetries + 1} attempt(s). Last error: ${errorMessage}`,
 			);
 		} catch (error) {
 			this.applyLinearRateLimitCooldown(error);
 			this.logger.warn(
-				`Failed to post Linear queue failure for ${item.issueIdentifier}: ${this.formatLinearQueueError(error)}`,
+				`Failed to post Linear queue failure for ${item.workItemIdentifier}: ${this.formatLinearQueueError(error)}`,
 			);
 		}
+	}
+
+	private async postGitHubQueueFailure(
+		item: AgentSessionQueueItem,
+		errorMessage: string,
+	): Promise<void> {
+		if (!item.githubEvent) {
+			return;
+		}
+
+		const body = `Cyrus could not complete ${item.workItemIdentifier} after ${
+			this.linearSessionMaxRetries + 1
+		} attempt(s). Last error: ${errorMessage}`;
+		const repository = item.githubRepositoryId
+			? this.repositories.get(item.githubRepositoryId)
+			: null;
+		await this.postGitHubLinkedLinearThought(
+			item.githubEvent,
+			repository,
+			body,
+		);
+		await this.postGitHubIssueComment(item.githubEvent, body);
 	}
 
 	private applyLinearRateLimitCooldown(error: unknown): boolean {
@@ -5722,14 +6119,21 @@ ${taskSection}`;
 		try {
 			const rawQueue = await readFile(this.linearSessionQueueFile, "utf8");
 			const parsed = JSON.parse(rawQueue) as
-				| SerializedLinearSessionQueueItem[]
-				| { items?: SerializedLinearSessionQueueItem[] };
+				| SerializedAgentSessionQueueItem[]
+				| { items?: SerializedAgentSessionQueueItem[] };
 			const items = Array.isArray(parsed) ? parsed : parsed.items || [];
 			const now = Date.now();
 			let recoveredRunningCount = 0;
 
 			this.linearSessionQueue = items
-				.filter((item) => item?.sessionId && item?.webhook)
+				.filter(
+					(item) =>
+						item?.sessionId &&
+						(item?.webhook || item?.githubEvent) &&
+						(item.origin === "github" ||
+							item.origin === "linear" ||
+							!item.origin),
+				)
 				.map((item) => {
 					const wasRunning = item.state === "running";
 					const retryCount = Number.isFinite(item.retryCount)
@@ -5744,6 +6148,9 @@ ${taskSection}`;
 
 					return {
 						...item,
+						origin: item.origin ?? "linear",
+						workItemIdentifier:
+							item.workItemIdentifier ?? item.issueIdentifier ?? item.sessionId,
 						repoIds: Array.isArray(item.repoIds) ? item.repoIds : [],
 						retryCount: wasRunning ? retryCount + 1 : retryCount,
 						availableAt: wasRunning
@@ -5759,7 +6166,7 @@ ${taskSection}`;
 
 			if (this.linearSessionQueue.length > 0) {
 				this.logger.info(
-					`Loaded ${this.linearSessionQueue.length} Linear queue item(s) from disk`,
+					`Loaded ${this.linearSessionQueue.length} agent queue item(s) from disk`,
 				);
 			}
 			if (recoveredRunningCount > 0) {
@@ -5781,7 +6188,7 @@ ${taskSection}`;
 	}
 
 	private async saveLinearSessionQueue(): Promise<void> {
-		const items: SerializedLinearSessionQueueItem[] = [
+		const items: SerializedAgentSessionQueueItem[] = [
 			...Array.from(this.linearSessionActiveItems.values()).map((item) => ({
 				...item,
 				state: "running" as const,
@@ -5815,14 +6222,16 @@ ${taskSection}`;
 		const beforeCount = this.linearSessionQueue.length;
 		this.linearSessionQueue = this.linearSessionQueue.filter(
 			(item) =>
-				item.webhook.agentSession?.issue?.id !== issueId &&
-				item.webhook.agentSession?.issue?.identifier !== issueIdentifier,
+				item.origin !== "linear" ||
+				(item.webhook?.agentSession?.issue?.id !== issueId &&
+					item.webhook?.agentSession?.issue?.identifier !== issueIdentifier),
 		);
 
 		for (const item of this.linearSessionActiveItems.values()) {
 			if (
-				item.webhook.agentSession?.issue?.id === issueId ||
-				item.webhook.agentSession?.issue?.identifier === issueIdentifier
+				item.origin === "linear" &&
+				(item.webhook?.agentSession?.issue?.id === issueId ||
+					item.webhook?.agentSession?.issue?.identifier === issueIdentifier)
 			) {
 				this.stopLinearSessionQueueItem(item);
 			}
