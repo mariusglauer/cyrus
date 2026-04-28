@@ -2421,6 +2421,16 @@ export class EdgeWorker extends EventEmitter {
 				this.logger.info(`GitHub session started: ${sessionInfo.sessionId}`);
 				completed = true;
 
+				await agentSessionManager.publishFrontendScreenshotsForPullRequest(
+					githubSessionId,
+					workspace.path,
+					String(prNumber),
+					{
+						baseBranch: baseBranchRef ?? repository.baseBranch,
+						branch: branchRef,
+					},
+				);
+
 				if (markedPullRequestDraft) {
 					await this.setGitHubPullRequestDraftState(event, false);
 				}
@@ -2877,6 +2887,7 @@ ${taskInstructions}
 - Make changes directly to the code on this branch
 - After making changes, commit and push them to the branch
 - Cyrus manages the PR draft/ready state automatically for this follow-up
+- For frontend/UI changes where visual verification makes sense, capture at least one screenshot and leave the screenshot file in the workspace so Cyrus can attach it to the PR
 - Be concise in your responses as they will be posted back to the GitHub PR`;
 	}
 
@@ -2906,6 +2917,7 @@ ${reviewBody}
 - Address all the reviewer's feedback and make the necessary changes
 - After making changes, commit and push them to the branch
 - Cyrus manages the PR draft/ready state automatically for this follow-up
+- For frontend/UI changes where visual verification makes sense, capture at least one screenshot and leave the screenshot file in the workspace so Cyrus can attach it to the PR
 - Respond with a concise summary of the changes you made`
 			: `## Instructions
 - The reviewer has requested changes but did not leave a summary comment
@@ -2914,6 +2926,7 @@ ${reviewBody}
 - Address all the reviewer's feedback and make the necessary changes
 - After making changes, commit and push them to the branch
 - Cyrus manages the PR draft/ready state automatically for this follow-up
+- For frontend/UI changes where visual verification makes sense, capture at least one screenshot and leave the screenshot file in the workspace so Cyrus can attach it to the PR
 - Respond with a concise summary of the changes you made`;
 
 		return `You are working on a GitHub Pull Request that has received a change request review.

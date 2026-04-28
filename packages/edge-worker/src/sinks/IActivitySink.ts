@@ -27,6 +27,26 @@ export interface ActivityPostResult {
 }
 
 /**
+ * Input for uploading a local file through the backing activity platform.
+ */
+export interface ActivityFileUploadInput {
+	filePath: string;
+	filename: string;
+	contentType: string;
+	makePublic?: boolean;
+}
+
+/**
+ * Result of uploading a local file through the backing activity platform.
+ */
+export interface ActivityFileUploadResult {
+	assetUrl: string;
+	filename: string;
+	contentType: string;
+	size: number;
+}
+
+/**
  * Interface for activity sinks that receive and process agent session activities.
  *
  * IActivitySink decouples activity posting from IIssueTrackerService, enabling
@@ -66,4 +86,11 @@ export interface IActivitySink {
 	 * @returns Promise that resolves with the created session ID
 	 */
 	createAgentSession(issueId: string): Promise<string>;
+
+	/**
+	 * Upload a local file and return an embeddable asset URL when supported.
+	 */
+	uploadFile?(
+		input: ActivityFileUploadInput,
+	): Promise<ActivityFileUploadResult>;
 }

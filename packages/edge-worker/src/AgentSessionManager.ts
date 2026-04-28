@@ -1,5 +1,7 @@
 import { execFile } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { readdir, stat } from "node:fs/promises";
+import { basename, extname, isAbsolute, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import type {
 	APIAssistantMessage,
@@ -41,6 +43,21 @@ import type {
 
 const execFileAsync = promisify(execFile);
 const AUTO_PR_MAX_BUFFER = 10 * 1024 * 1024;
+const PR_SCREENSHOT_COMMENT_MARKER = "<!-- cyrus-frontend-screenshots -->";
+const MAX_FRONTEND_SCREENSHOTS = 6;
+const MAX_SCREENSHOT_SIZE_BYTES = 10 * 1024 * 1024;
+const SCREENSHOT_SCAN_MAX_FILES = 5000;
+const SCREENSHOT_SCAN_MAX_DEPTH = 8;
+const SCREENSHOT_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp"]);
+const SKIPPED_SCREENSHOT_DIRS = new Set([
+	".git",
+	".next",
+	".turbo",
+	"build",
+	"dist",
+	"node_modules",
+	"out",
+]);
 
 /**
  * Events emitted by AgentSessionManager
@@ -62,6 +79,15 @@ type PullRequestInfo = {
 	body?: string;
 	baseRefName?: string;
 	headRefName?: string;
+};
+
+type ScreenshotCandidate = {
+	path: string;
+	filename: string;
+	contentType: string;
+	size: number;
+	mtimeMs: number;
+	source: "tool" | "scan";
 };
 
 /**
@@ -99,6 +125,7 @@ export class AgentSessionManager extends EventEmitter {
 		new Map(); // Whether the buffered body above is a tool_use input JSON (no trailing assistant text) — guards against posting raw JSON as the "response" (CYPACK-1177)
 	private bufferedAssistantEntryBySession: Map<string, CyrusAgentSessionEntry> =
 		new Map(); // One-behind buffer: holds last assistant entry until next message or result
+	private screenshotPathsBySession: Map<string, Set<string>> = new Map(); // Screenshot file paths observed from browser/screenshot tool calls
 	private taskSubjectsByToolUseId: Map<string, string> = new Map(); // Cache TaskCreate subjects by toolUseId until result arrives with task ID
 	private taskSubjectsById: Map<string, string> = new Map(); // Cache task subjects by task ID (e.g., "1" → "Fix login bug")
 	private activeStatusActivitiesBySession: Map<string, string> = new Map(); // Maps session ID to active compacting status activity ID
@@ -502,6 +529,7 @@ export class AgentSessionManager extends EventEmitter {
 
 			if (gitStatus.stdout.trim()) {
 				await this.runWorkspaceCommand(repoDir, "git", ["add", "-A"]);
+				await this.unstageGeneratedScreenshotCandidates(repoDir, session);
 				const stagedStatus = await this.runWorkspaceCommand(repoDir, "git", [
 					"diff",
 					"--cached",
@@ -548,6 +576,11 @@ export class AgentSessionManager extends EventEmitter {
 			if (aheadCount === "0") {
 				return resultMessage;
 			}
+			const changedFiles = await this.getChangedFilesForRefRange(
+				repoDir,
+				baseRef,
+				currentBranch,
+			);
 
 			await this.runWorkspaceCommand(repoDir, "git", [
 				"push",
@@ -576,6 +609,17 @@ export class AgentSessionManager extends EventEmitter {
 				session,
 				resultMessage,
 			});
+			await this.publishFrontendScreenshotsForPullRequest(
+				sessionId,
+				repoDir,
+				pullRequestUrl,
+				{
+					changedFiles,
+					baseBranch,
+					branch: currentBranch,
+					resultMessage,
+				},
+			);
 
 			return this.appendResultNote(resultMessage, pullRequestUrl);
 		} catch (error) {
@@ -649,6 +693,580 @@ export class AgentSessionManager extends EventEmitter {
 		}
 
 		return pullRequest;
+	}
+
+	async publishFrontendScreenshotsForPullRequest(
+		sessionId: string,
+		repoDir: string,
+		pullRequestRef: string,
+		options: {
+			changedFiles?: string[];
+			baseBranch?: string;
+			branch?: string;
+			resultMessage?: SDKResultMessage;
+		} = {},
+	): Promise<string[]> {
+		const session = this.sessions.get(sessionId);
+		const log = this.sessionLog(sessionId);
+		if (!session) {
+			log.warn("Cannot publish frontend screenshots: no session found");
+			return [];
+		}
+
+		try {
+			const contextChangedFiles =
+				options.changedFiles ??
+				(await this.getChangedFilesForPullRequestContext(
+					repoDir,
+					session,
+					options,
+				));
+			const changedFiles = contextChangedFiles.length
+				? contextChangedFiles
+				: await this.getChangedFilesFromPullRequest(repoDir, pullRequestRef);
+			if (!this.isFrontendTask(session, changedFiles, options.resultMessage)) {
+				return [];
+			}
+
+			const activitySink = this.getActivitySink(sessionId);
+			if (!activitySink?.uploadFile) {
+				log.info(
+					"Skipping frontend screenshot PR comment: activity sink does not support file uploads",
+				);
+				return [];
+			}
+
+			const candidates = await this.collectScreenshotCandidates(session);
+			if (!candidates.length) {
+				log.info(
+					"Frontend-like changes detected, but no screenshot artifacts were found",
+				);
+				return [];
+			}
+
+			if (
+				await this.pullRequestAlreadyHasScreenshotComment(
+					repoDir,
+					pullRequestRef,
+				)
+			) {
+				log.info("Skipping frontend screenshot PR comment: already posted");
+				return [];
+			}
+
+			const uploadedScreenshots: Array<{ filename: string; assetUrl: string }> =
+				[];
+			for (const candidate of candidates) {
+				try {
+					const upload = await activitySink.uploadFile({
+						filePath: candidate.path,
+						filename: candidate.filename,
+						contentType: candidate.contentType,
+						makePublic: true,
+					});
+					if (upload.assetUrl) {
+						uploadedScreenshots.push({
+							filename: upload.filename,
+							assetUrl: upload.assetUrl,
+						});
+					}
+				} catch (error) {
+					log.warn(
+						`Failed to upload screenshot ${candidate.path}: ${
+							error instanceof Error ? error.message : String(error)
+						}`,
+					);
+				}
+			}
+
+			if (!uploadedScreenshots.length) {
+				return [];
+			}
+
+			await this.runWorkspaceCommand(repoDir, "gh", [
+				"pr",
+				"comment",
+				pullRequestRef,
+				"--body",
+				this.buildScreenshotComment(uploadedScreenshots),
+			]);
+			log.info(
+				`Posted ${uploadedScreenshots.length} frontend screenshot(s) to ${pullRequestRef}`,
+			);
+			return uploadedScreenshots.map((screenshot) => screenshot.assetUrl);
+		} catch (error) {
+			log.warn(
+				`Failed to publish frontend screenshots to PR: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			);
+			return [];
+		}
+	}
+
+	private async getChangedFilesForPullRequestContext(
+		repoDir: string,
+		session: CyrusAgentSession,
+		options: { baseBranch?: string; branch?: string },
+	): Promise<string[]> {
+		const branch =
+			options.branch ??
+			(
+				await this.runWorkspaceCommand(repoDir, "git", [
+					"branch",
+					"--show-current",
+				])
+			).stdout.trim();
+		if (!branch) {
+			return [];
+		}
+
+		const baseBranch = options.baseBranch ?? this.getSessionBaseBranch(session);
+		const baseRef = (await this.tryWorkspaceCommand(repoDir, "git", [
+			"rev-parse",
+			"--verify",
+			baseBranch,
+		]))
+			? baseBranch
+			: `origin/${baseBranch}`;
+		return await this.getChangedFilesForRefRange(repoDir, baseRef, branch);
+	}
+
+	private async getChangedFilesForRefRange(
+		repoDir: string,
+		baseRef: string,
+		branch: string,
+	): Promise<string[]> {
+		const result = await this.tryWorkspaceCommand(repoDir, "git", [
+			"diff",
+			"--name-only",
+			`${baseRef}..${branch}`,
+		]);
+		return (result?.stdout ?? "")
+			.split("\n")
+			.map((line) => line.trim())
+			.filter(Boolean);
+	}
+
+	private async getChangedFilesFromPullRequest(
+		repoDir: string,
+		pullRequestRef: string,
+	): Promise<string[]> {
+		const result = await this.tryWorkspaceCommand(repoDir, "gh", [
+			"pr",
+			"view",
+			pullRequestRef,
+			"--json",
+			"files",
+		]);
+		if (!result) {
+			return [];
+		}
+
+		const parsed = JSON.parse(result.stdout || "{}") as {
+			files?: Array<{ path?: string; filename?: string; name?: string }>;
+		};
+		return (parsed.files ?? [])
+			.map((file) => file.path ?? file.filename ?? file.name ?? "")
+			.map((file) => file.trim())
+			.filter(Boolean);
+	}
+
+	private async unstageGeneratedScreenshotCandidates(
+		repoDir: string,
+		session: CyrusAgentSession,
+	): Promise<void> {
+		const candidates = await this.collectScreenshotCandidates(session);
+		for (const candidate of candidates) {
+			const relativePath = this.getRepoRelativePath(repoDir, candidate.path);
+			if (!relativePath) {
+				continue;
+			}
+			await this.tryWorkspaceCommand(repoDir, "git", [
+				"restore",
+				"--staged",
+				"--",
+				relativePath,
+			]);
+		}
+	}
+
+	private getRepoRelativePath(
+		repoDir: string,
+		filePath: string,
+	): string | undefined {
+		const resolvedRepoDir = resolve(repoDir);
+		const resolvedFilePath = resolve(filePath);
+		const relativePath = relative(resolvedRepoDir, resolvedFilePath);
+		if (
+			!relativePath ||
+			relativePath.startsWith("..") ||
+			isAbsolute(relativePath)
+		) {
+			return undefined;
+		}
+		return relativePath;
+	}
+
+	private isFrontendTask(
+		session: CyrusAgentSession,
+		changedFiles: string[],
+		resultMessage?: SDKResultMessage,
+	): boolean {
+		if (changedFiles.some((file) => this.isFrontendFile(file))) {
+			return true;
+		}
+
+		const resultText =
+			resultMessage &&
+			"result" in resultMessage &&
+			typeof resultMessage.result === "string"
+				? resultMessage.result
+				: "";
+		const issueDescription =
+			"description" in (session.issue ?? {})
+				? String((session.issue as { description?: unknown }).description ?? "")
+				: "";
+		const text = [session.issue?.title, issueDescription, resultText]
+			.filter(Boolean)
+			.join("\n")
+			.toLowerCase();
+
+		return /\b(frontend|front-end|ui|ux|visual|style|css|scss|sass|tailwind|react|vue|svelte|component|modal|button|layout|responsive|mobile|desktop|browser|page|screen|view|form|dropdown|navbar|dashboard)\b/.test(
+			text,
+		);
+	}
+
+	private isFrontendFile(file: string): boolean {
+		const normalized = file.replace(/\\/g, "/").toLowerCase();
+		if (
+			/\.(astro|css|html|jsx|less|scss|sass|svelte|tsx|vue)$/.test(normalized)
+		) {
+			return true;
+		}
+		return (
+			normalized.startsWith("apps/app/") ||
+			normalized.startsWith("apps/page-assets/") ||
+			normalized.startsWith("client/") ||
+			normalized.startsWith("frontend/") ||
+			normalized.startsWith("web/") ||
+			/(^|\/)(components|pages|screens|styles|ui|views)\//.test(normalized)
+		);
+	}
+
+	private async collectScreenshotCandidates(
+		session: CyrusAgentSession,
+	): Promise<ScreenshotCandidate[]> {
+		const workspacePath = session.workspace.path;
+		const cutoffMs = Math.max(0, session.createdAt - 10 * 60 * 1000);
+		const seen = new Set<string>();
+		const candidates: ScreenshotCandidate[] = [];
+
+		const addCandidate = async (
+			filePath: string,
+			source: ScreenshotCandidate["source"],
+		): Promise<void> => {
+			const resolvedPath = isAbsolute(filePath)
+				? filePath
+				: resolve(workspacePath, filePath);
+			if (seen.has(resolvedPath)) {
+				return;
+			}
+			const candidate = await this.toScreenshotCandidate(
+				resolvedPath,
+				source,
+				cutoffMs,
+			);
+			if (!candidate) {
+				return;
+			}
+			seen.add(resolvedPath);
+			candidates.push(candidate);
+		};
+
+		const trackedPaths = this.screenshotPathsBySession.get(session.id);
+		if (trackedPaths) {
+			for (const filePath of trackedPaths) {
+				await addCandidate(filePath, "tool");
+			}
+		}
+
+		const scannedCandidates = await this.scanWorkspaceForScreenshots(
+			workspacePath,
+			cutoffMs,
+		);
+		for (const candidate of scannedCandidates) {
+			if (!seen.has(candidate.path)) {
+				seen.add(candidate.path);
+				candidates.push(candidate);
+			}
+		}
+
+		return candidates
+			.sort((a, b) => {
+				if (a.source !== b.source) {
+					return a.source === "tool" ? -1 : 1;
+				}
+				return b.mtimeMs - a.mtimeMs;
+			})
+			.slice(0, MAX_FRONTEND_SCREENSHOTS);
+	}
+
+	private async scanWorkspaceForScreenshots(
+		workspacePath: string,
+		cutoffMs: number,
+	): Promise<ScreenshotCandidate[]> {
+		const candidates: ScreenshotCandidate[] = [];
+		const stack: Array<{ dir: string; depth: number }> = [
+			{ dir: workspacePath, depth: 0 },
+		];
+		let scannedFiles = 0;
+
+		while (
+			stack.length > 0 &&
+			candidates.length < MAX_FRONTEND_SCREENSHOTS &&
+			scannedFiles < SCREENSHOT_SCAN_MAX_FILES
+		) {
+			const current = stack.pop();
+			if (!current) {
+				continue;
+			}
+
+			const entries = await readdir(current.dir, { withFileTypes: true }).catch(
+				() => [],
+			);
+			for (const entry of entries) {
+				const entryPath = resolve(current.dir, entry.name);
+				if (entry.isDirectory()) {
+					if (
+						current.depth < SCREENSHOT_SCAN_MAX_DEPTH &&
+						!SKIPPED_SCREENSHOT_DIRS.has(entry.name)
+					) {
+						stack.push({ dir: entryPath, depth: current.depth + 1 });
+					}
+					continue;
+				}
+
+				if (!entry.isFile()) {
+					continue;
+				}
+				scannedFiles++;
+				if (!this.looksLikeGeneratedScreenshotPath(entryPath)) {
+					continue;
+				}
+				const candidate = await this.toScreenshotCandidate(
+					entryPath,
+					"scan",
+					cutoffMs,
+				);
+				if (candidate) {
+					candidates.push(candidate);
+				}
+			}
+		}
+
+		return candidates;
+	}
+
+	private async toScreenshotCandidate(
+		filePath: string,
+		source: ScreenshotCandidate["source"],
+		cutoffMs: number,
+	): Promise<ScreenshotCandidate | undefined> {
+		const extension = extname(filePath).toLowerCase();
+		if (!SCREENSHOT_EXTENSIONS.has(extension)) {
+			return undefined;
+		}
+
+		const fileStat = await stat(filePath).catch(() => undefined);
+		if (
+			!fileStat?.isFile() ||
+			fileStat.size <= 0 ||
+			fileStat.size > MAX_SCREENSHOT_SIZE_BYTES
+		) {
+			return undefined;
+		}
+		if (source === "scan" && fileStat.mtimeMs < cutoffMs) {
+			return undefined;
+		}
+
+		return {
+			path: filePath,
+			filename: this.sanitizeScreenshotFilename(basename(filePath)),
+			contentType: this.getImageContentType(extension),
+			size: fileStat.size,
+			mtimeMs: fileStat.mtimeMs,
+			source,
+		};
+	}
+
+	private looksLikeGeneratedScreenshotPath(filePath: string): boolean {
+		const lower = filePath.toLowerCase();
+		return /screenshot|screen-shot|playwright|cypress|test-results|visual|browser|chrome-devtools|puppeteer|snapshot/.test(
+			lower,
+		);
+	}
+
+	private sanitizeScreenshotFilename(filename: string): string {
+		const sanitized = filename.replace(/[^a-zA-Z0-9._-]/g, "_");
+		return sanitized || `screenshot${Date.now()}.png`;
+	}
+
+	private getImageContentType(extension: string): string {
+		switch (extension) {
+			case ".jpg":
+			case ".jpeg":
+				return "image/jpeg";
+			case ".webp":
+				return "image/webp";
+			default:
+				return "image/png";
+		}
+	}
+
+	private async pullRequestAlreadyHasScreenshotComment(
+		repoDir: string,
+		pullRequestRef: string,
+	): Promise<boolean> {
+		const result = await this.tryWorkspaceCommand(repoDir, "gh", [
+			"pr",
+			"view",
+			pullRequestRef,
+			"--json",
+			"comments",
+		]);
+		if (!result) {
+			return false;
+		}
+
+		const parsed = JSON.parse(result.stdout || "{}") as {
+			comments?: Array<{ body?: string }>;
+		};
+		return (
+			parsed.comments?.some((comment) =>
+				comment.body?.includes(PR_SCREENSHOT_COMMENT_MARKER),
+			) ?? false
+		);
+	}
+
+	private buildScreenshotComment(
+		screenshots: Array<{ filename: string; assetUrl: string }>,
+	): string {
+		const lines = [
+			PR_SCREENSHOT_COMMENT_MARKER,
+			"## Frontend screenshots",
+			"",
+			"Cyrus collected these after finishing the frontend change:",
+			"",
+		];
+		for (const screenshot of screenshots) {
+			lines.push(`![${screenshot.filename}](${screenshot.assetUrl})`, "");
+		}
+		return lines.join("\n").trim();
+	}
+
+	private rememberScreenshotPathsFromToolInteraction(
+		sessionId: string,
+		toolName: string,
+		toolInput?: unknown,
+		toolResultContent?: string,
+	): void {
+		if (!this.isScreenshotRelatedTool(toolName, toolInput, toolResultContent)) {
+			return;
+		}
+
+		for (const filePath of this.extractScreenshotPaths(toolInput)) {
+			this.rememberScreenshotPath(sessionId, filePath);
+		}
+		for (const filePath of this.extractScreenshotPaths(toolResultContent)) {
+			this.rememberScreenshotPath(sessionId, filePath);
+		}
+	}
+
+	private isScreenshotRelatedTool(
+		toolName: string,
+		toolInput?: unknown,
+		toolResultContent?: string,
+	): boolean {
+		const haystack = [
+			toolName,
+			this.stringifyForSearch(toolInput),
+			toolResultContent,
+		]
+			.filter(Boolean)
+			.join("\n")
+			.toLowerCase();
+		return /screenshot|screen-shot|take_screenshot|playwright|chrome-devtools|puppeteer|browser|computer|gif_creator/.test(
+			haystack,
+		);
+	}
+
+	private stringifyForSearch(value: unknown): string {
+		if (typeof value === "string") {
+			return value;
+		}
+		try {
+			return JSON.stringify(value ?? {});
+		} catch {
+			return "";
+		}
+	}
+
+	private extractScreenshotPaths(value: unknown): string[] {
+		const strings: string[] = [];
+		const visit = (current: unknown, depth: number): void => {
+			if (depth > 4 || current === null || current === undefined) {
+				return;
+			}
+			if (typeof current === "string") {
+				strings.push(current);
+				return;
+			}
+			if (Array.isArray(current)) {
+				for (const item of current) {
+					visit(item, depth + 1);
+				}
+				return;
+			}
+			if (typeof current === "object") {
+				for (const item of Object.values(current as Record<string, unknown>)) {
+					visit(item, depth + 1);
+				}
+			}
+		};
+
+		visit(value, 0);
+
+		const paths = new Set<string>();
+		const absolutePathRegex =
+			/(?:\/[^\s"'`<>|]+?\.(?:png|jpe?g|webp))|(?:[A-Za-z]:\\[^\r\n"'`<>|]+?\.(?:png|jpe?g|webp))/gi;
+		const relativePathRegex =
+			/(?:^|[\s"'`])((?:\.{1,2}\/|[A-Za-z0-9_.-]+\/)[^\s"'`<>|]+?\.(?:png|jpe?g|webp))/gi;
+
+		for (const text of strings) {
+			for (const match of text.matchAll(absolutePathRegex)) {
+				if (match[0]) {
+					paths.add(match[0]);
+				}
+			}
+			for (const match of text.matchAll(relativePathRegex)) {
+				if (match[1]) {
+					paths.add(match[1]);
+				}
+			}
+		}
+
+		return Array.from(paths);
+	}
+
+	private rememberScreenshotPath(sessionId: string, filePath: string): void {
+		const trimmedPath = filePath.trim();
+		if (!trimmedPath) {
+			return;
+		}
+		const existing = this.screenshotPathsBySession.get(sessionId) ?? new Set();
+		existing.add(trimmedPath);
+		this.screenshotPathsBySession.set(sessionId, existing);
 	}
 
 	private async createPullRequest(
@@ -1389,6 +2007,12 @@ export class AgentSessionManager extends EventEmitter {
 							);
 							const toolName = originalTool?.name || "Tool";
 							const toolInput = originalTool?.input || "";
+							this.rememberScreenshotPathsFromToolInteraction(
+								sessionId,
+								toolName,
+								toolInput,
+								toolResult.content,
+							);
 
 							// Clean up the tool call from our tracking map
 							if (entry.metadata.toolUseId) {
@@ -1537,6 +2161,11 @@ export class AgentSessionManager extends EventEmitter {
 					// Assistant messages can be thoughts or responses
 					if (entry.metadata?.toolUseId) {
 						const toolName = entry.metadata.toolName || "Tool";
+						this.rememberScreenshotPathsFromToolInteraction(
+							sessionId,
+							toolName,
+							entry.metadata.toolInput,
+						);
 
 						// Store tool information for later use in tool results
 						if (entry.metadata.toolUseId) {

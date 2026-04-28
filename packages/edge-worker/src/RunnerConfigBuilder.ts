@@ -607,8 +607,51 @@ export class RunnerConfigBuilder {
 							const filePath = response?.path || "the screenshot file";
 							return {
 								continue: true,
-								additionalContext: `Screenshot taken successfully. To share this screenshot in Linear comments, use the linear_upload_file tool to upload ${filePath}. This will return an asset URL that can be embedded in markdown. You can also use the Read tool to view the screenshot file to analyze the visual content.`,
+								additionalContext: `Screenshot taken successfully. For frontend/UI work, keep this file available so Cyrus can attach it to the GitHub PR when the task finishes. To share it in Linear comments yourself, use the linear_upload_file tool to upload ${filePath}. You can also use the Read tool to view the screenshot file to analyze the visual content.`,
 							};
+						},
+					],
+				},
+				{
+					matcher: "mcp__claude-in-chrome__computer",
+					hooks: [
+						async (input, _toolUseID, { signal: _signal }) => {
+							const postToolUseInput = input as PostToolUseHookInput;
+							const response = postToolUseInput.tool_response as {
+								action?: string;
+								imageId?: string;
+								path?: string;
+							};
+							// Only provide upload guidance for screenshot actions
+							if (response?.action === "screenshot") {
+								const filePath = response?.path || "the screenshot file";
+								return {
+									continue: true,
+									additionalContext: `Screenshot captured. For frontend/UI work, keep this file available so Cyrus can attach it to the GitHub PR when the task finishes. To share it in Linear comments yourself, use the linear_upload_file tool to upload ${filePath}.`,
+								};
+							}
+							return { continue: true };
+						},
+					],
+				},
+				{
+					matcher: "mcp__claude-in-chrome__gif_creator",
+					hooks: [
+						async (input, _toolUseID, { signal: _signal }) => {
+							const postToolUseInput = input as PostToolUseHookInput;
+							const response = postToolUseInput.tool_response as {
+								action?: string;
+								path?: string;
+							};
+							// Only provide upload guidance for export actions
+							if (response?.action === "export") {
+								const filePath = response?.path || "the exported GIF";
+								return {
+									continue: true,
+									additionalContext: `GIF exported successfully. For frontend/UI work, keep this file available so Cyrus can attach it to the GitHub PR when the task finishes. To share it in Linear comments yourself, use the linear_upload_file tool to upload ${filePath}.`,
+								};
+							}
+							return { continue: true };
 						},
 					],
 				},
@@ -624,7 +667,7 @@ export class RunnerConfigBuilder {
 							const filePath = toolInput?.filePath || "the screenshot file";
 							return {
 								continue: true,
-								additionalContext: `Screenshot saved. To share this screenshot in Linear comments, use the linear_upload_file tool to upload ${filePath}. This will return an asset URL that can be embedded in markdown.`,
+								additionalContext: `Screenshot saved. For frontend/UI work, keep this file available so Cyrus can attach it to the GitHub PR when the task finishes. To share it in Linear comments yourself, use the linear_upload_file tool to upload ${filePath}.`,
 							};
 						},
 					],
@@ -752,7 +795,8 @@ export function inspectGitGuardrail(cwd: string, log: ILogger): string | null {
 		"Before stopping:\n" +
 		"1. Commit any uncommitted changes with a descriptive message.\n" +
 		"2. Push the branch to the remote.\n" +
-		"3. Create or update a pull request that summarizes the change.\n\n" +
+		"3. Create or update a pull request that summarizes the change.\n" +
+		"4. For frontend/UI changes, keep at least one relevant screenshot file in the workspace so Cyrus can attach it to the GitHub PR.\n\n" +
 		"If the work is genuinely complete and a PR is not appropriate (for example, a question or research task with no intended code changes), you may stop again — this guardrail only blocks once per session."
 	);
 }

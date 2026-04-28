@@ -85,7 +85,9 @@ IMPORTANT: Use the TaskCreate tool to track your progress:
 
 5. Run tests and ensure code quality
 
-6. Create or update the pull request with adequate description
+6. For frontend/UI changes where visual verification makes sense, capture at least one screenshot and leave the screenshot file in the workspace so Cyrus can attach it to the GitHub PR
+
+7. Create or update the pull request with adequate description
 
 ### If Situation 2 (Clarify):
 1. First, use TaskCreate to create investigation tasks:

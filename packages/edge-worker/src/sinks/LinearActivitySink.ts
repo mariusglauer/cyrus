@@ -1,9 +1,12 @@
+import { readFile, stat } from "node:fs/promises";
 import {
 	type AgentActivityContent,
 	AgentActivitySignal,
 	type IIssueTrackerService,
 } from "cyrus-core";
 import type {
+	ActivityFileUploadInput,
+	ActivityFileUploadResult,
 	ActivityPostOptions,
 	ActivityPostResult,
 	ActivitySignal,
@@ -134,5 +137,49 @@ export class LinearActivitySink implements IActivitySink {
 			);
 		}
 		return session.id;
+	}
+
+	/**
+	 * Upload a local file through Linear and return the resulting asset URL.
+	 */
+	async uploadFile(
+		input: ActivityFileUploadInput,
+	): Promise<ActivityFileUploadResult> {
+		const fileStat = await stat(input.filePath);
+		if (!fileStat.isFile()) {
+			throw new Error(`Cannot upload ${input.filePath}: not a file`);
+		}
+
+		const upload = await this.issueTracker.requestFileUpload({
+			contentType: input.contentType,
+			filename: input.filename,
+			size: fileStat.size,
+			makePublic: input.makePublic,
+		});
+
+		const uploadHeaders: Record<string, string> = {
+			"Content-Type": input.contentType,
+			"Cache-Control": "public, max-age=31536000",
+			...upload.headers,
+		};
+		const uploadResponse = await fetch(upload.uploadUrl, {
+			method: "PUT",
+			headers: uploadHeaders,
+			body: await readFile(input.filePath),
+		});
+
+		if (!uploadResponse.ok) {
+			const errorText = await uploadResponse.text();
+			throw new Error(
+				`Failed to upload ${input.filename}: ${uploadResponse.status} ${uploadResponse.statusText} ${errorText}`,
+			);
+		}
+
+		return {
+			assetUrl: upload.assetUrl,
+			filename: input.filename,
+			contentType: input.contentType,
+			size: fileStat.size,
+		};
 	}
 }
