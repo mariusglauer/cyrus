@@ -256,6 +256,7 @@ type GarbageCollectionSummary = {
 	skippedProtected: number;
 	skippedOpenPullRequests: number;
 	skippedUnknownPullRequests: number;
+	skippedBecauseBusy?: boolean;
 	errors: string[];
 };
 
@@ -387,6 +388,12 @@ export class EdgeWorker extends EventEmitter {
 	private readonly garbageCollectionDeleteRemoteBranches =
 		process.env.CYRUS_GC_DELETE_REMOTE_BRANCHES?.toLowerCase().trim() ===
 		"true";
+	private readonly garbageCollectionRunWhenBusy =
+		process.env.CYRUS_GC_RUN_WHEN_BUSY?.toLowerCase().trim() === "true";
+	private readonly garbageCollectionMaxRemovalsPerRun = Math.max(
+		1,
+		Number.parseInt(process.env.CYRUS_GC_MAX_REMOVALS_PER_RUN || "5", 10) || 5,
+	);
 	private readonly operationalMonitorIntervalMs = Math.max(
 		30_000,
 		Number.parseInt(
@@ -3796,6 +3803,8 @@ ${taskSection}`;
 				sessionTtlMs: this.garbageCollectionSessionTtlMs,
 				terminalPrGraceMs: this.garbageCollectionTerminalPrGraceMs,
 				deleteRemoteBranches: this.garbageCollectionDeleteRemoteBranches,
+				runWhenBusy: this.garbageCollectionRunWhenBusy,
+				maxRemovalsPerRun: this.garbageCollectionMaxRemovalsPerRun,
 				lastRun: this.lastGarbageCollectionSummary,
 			},
 		};
@@ -4002,8 +4011,6 @@ ${taskSection}`;
 			void this.runGarbageCollection("scheduled");
 		}, this.garbageCollectionIntervalMs);
 		this.garbageCollectionTimer.unref?.();
-
-		void this.runGarbageCollection("startup");
 	}
 
 	private async runGarbageCollection(reason: string): Promise<void> {
@@ -4029,6 +4036,14 @@ ${taskSection}`;
 		};
 
 		try {
+			if (
+				!this.garbageCollectionRunWhenBusy &&
+				this.computeStatus() !== "idle"
+			) {
+				summary.skippedBecauseBusy = true;
+				return;
+			}
+
 			summary.removedSessions = this.agentSessionManager.cleanup(
 				this.garbageCollectionSessionTtlMs,
 			);
@@ -4122,6 +4137,9 @@ ${taskSection}`;
 
 		const entries = await readdir(worktreesDir, { withFileTypes: true });
 		for (const entry of entries) {
+			if (this.hasReachedGarbageCollectionRemovalLimit(summary)) {
+				break;
+			}
 			if (!entry.isDirectory()) {
 				continue;
 			}
@@ -4215,6 +4233,9 @@ ${taskSection}`;
 				repository.repositoryPath,
 			);
 			for (const branch of this.listLocalBranches(repository.repositoryPath)) {
+				if (this.hasReachedGarbageCollectionRemovalLimit(summary)) {
+					return;
+				}
 				if (!this.isCyrusGarbageCollectionBranch(branch)) {
 					continue;
 				}
@@ -4249,6 +4270,17 @@ ${taskSection}`;
 				);
 			}
 		}
+	}
+
+	private hasReachedGarbageCollectionRemovalLimit(
+		summary: GarbageCollectionSummary,
+	): boolean {
+		return (
+			summary.removedWorktrees +
+				summary.removedLocalBranches +
+				summary.removedRemoteBranches >=
+			this.garbageCollectionMaxRemovalsPerRun
+		);
 	}
 
 	private listWorktreeBranchRefs(workspacePath: string): WorktreeBranchRef[] {
