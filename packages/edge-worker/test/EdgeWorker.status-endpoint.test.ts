@@ -286,6 +286,7 @@ describe("EdgeWorker - Status Endpoint", () => {
 						id: "linear-session-1",
 						externalSessionId: "linear-session-1",
 						status: "active",
+						updatedAt: Date.now(),
 						issueContext: {
 							trackerId: "linear",
 							issueId: "issue-1",
@@ -364,6 +365,38 @@ describe("EdgeWorker - Status Endpoint", () => {
 			).recoverInterruptedActiveLinearSessionsFromState();
 
 			expect((edgeWorker as any).linearSessionQueue).toHaveLength(1);
+		});
+
+		it("ignores stale active sessions outside the recovery lookback", async () => {
+			edgeWorker = new EdgeWorker(mockConfig);
+			(edgeWorker as any).saveLinearSessionQueue = vi
+				.fn()
+				.mockResolvedValue(undefined);
+
+			(edgeWorker as any).agentSessionManager.getActiveSessions = vi
+				.fn()
+				.mockReturnValue([
+					{
+						id: "linear-session-1",
+						externalSessionId: "linear-session-1",
+						status: "active",
+						updatedAt: Date.now() - 24 * 60 * 60 * 1_000,
+						issueContext: {
+							trackerId: "linear",
+							issueId: "issue-1",
+							issueIdentifier: "FC-4132",
+						},
+						issue: { id: "issue-1", identifier: "FC-4132" },
+						repositories: [{ repositoryId: "test-repo" }],
+					},
+				]);
+
+			await (
+				edgeWorker as any
+			).recoverInterruptedActiveLinearSessionsFromState();
+
+			expect((edgeWorker as any).linearSessionQueue).toHaveLength(0);
+			expect((edgeWorker as any).saveLinearSessionQueue).not.toHaveBeenCalled();
 		});
 
 		it("keeps a queued Linear item active until the agent session completes", async () => {

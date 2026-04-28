@@ -318,6 +318,13 @@ export class EdgeWorker extends EventEmitter {
 			10,
 		) || 3_900_000,
 	);
+	private readonly interruptedSessionRecoveryLookbackMs = Math.max(
+		60_000,
+		Number.parseInt(
+			process.env.CYRUS_RECOVER_ACTIVE_SESSION_LOOKBACK_MS || "7200000",
+			10,
+		) || 7_200_000,
+	);
 	private readonly operationalMonitorIntervalMs = Math.max(
 		30_000,
 		Number.parseInt(
@@ -6476,6 +6483,7 @@ ${taskSection}`;
 			if (
 				session.issueContext?.trackerId !== "linear" ||
 				session.agentRunner ||
+				this.isRecoveredActiveLinearSessionTooOld(session, now) ||
 				trackedSessionIds.has(sessionId)
 			) {
 				continue;
@@ -6556,6 +6564,14 @@ ${taskSection}`;
 			lastError: "Recovered active session after Cyrus restart.",
 			recoveredAt: now,
 		};
+	}
+
+	private isRecoveredActiveLinearSessionTooOld(
+		session: CyrusAgentSession,
+		now: number,
+	): boolean {
+		const lastTouchedAt = session.updatedAt ?? session.createdAt ?? 0;
+		return now - lastTouchedAt > this.interruptedSessionRecoveryLookbackMs;
 	}
 
 	private async saveLinearSessionQueue(): Promise<void> {
