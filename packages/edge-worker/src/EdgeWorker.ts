@@ -2171,6 +2171,13 @@ export class EdgeWorker extends EventEmitter {
 			return false;
 		}
 
+		if (this.isGitHubPullRequestTerminal(event.payload.pull_request)) {
+			this.logger.info(
+				`Ignoring pull_request_review on ${this.getGitHubWorkItemIdentifier(event)} because the pull request is already merged or closed`,
+			);
+			return false;
+		}
+
 		if (!this.isCyrusOwnedPullRequest(event.payload.pull_request)) {
 			this.logger.info(
 				`Ignoring pull_request_review on ${this.getGitHubWorkItemIdentifier(event)} because the pull request was not opened by Cyrus`,
@@ -2179,6 +2186,22 @@ export class EdgeWorker extends EventEmitter {
 		}
 
 		return true;
+	}
+
+	private isGitHubPullRequestTerminal(
+		pullRequest: GitHubPullRequest,
+	): boolean {
+		const terminalState = pullRequest.state?.toLowerCase() === "closed";
+		const mergeMetadata = pullRequest as GitHubPullRequest & {
+			merged?: boolean;
+			merged_at?: string | null;
+		};
+
+		return (
+			terminalState ||
+			mergeMetadata.merged === true ||
+			Boolean(mergeMetadata.merged_at)
+		);
 	}
 
 	private isCyrusOwnedPullRequest(pullRequest: GitHubPullRequest): boolean {
@@ -6437,6 +6460,27 @@ ${taskSection}`;
 	private isQueueableGitHubEvent(event: GitHubCommentWebhookEvent): boolean {
 		if (!isCommentOnPullRequest(event)) {
 			this.logger.debug("Ignoring GitHub comment on non-PR issue");
+			return false;
+		}
+
+		if (
+			isIssueCommentPayload(event.payload) &&
+			event.payload.issue.state?.toLowerCase() === "closed"
+		) {
+			this.logger.info(
+				`Ignoring GitHub comment on ${this.getGitHubWorkItemIdentifier(event)} because the pull request is already closed`,
+			);
+			return false;
+		}
+
+		if (
+			(isPullRequestReviewPayload(event.payload) ||
+				isPullRequestReviewCommentPayload(event.payload)) &&
+			this.isGitHubPullRequestTerminal(event.payload.pull_request)
+		) {
+			this.logger.info(
+				`Ignoring GitHub webhook on ${this.getGitHubWorkItemIdentifier(event)} because the pull request is already merged or closed`,
+			);
 			return false;
 		}
 

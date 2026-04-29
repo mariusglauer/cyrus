@@ -91,6 +91,9 @@ describe("EdgeWorker - GitHub review comments", () => {
 			pull_request: {
 				number: 12,
 				title: "Fix checkout",
+				state: "open",
+				merged: false,
+				merged_at: null,
 				head: { ref: "fix/checkout" },
 				base: { ref: "main" },
 			},
@@ -296,6 +299,59 @@ describe("EdgeWorker - GitHub review comments", () => {
 			head: { ref: "cyrus2/fc-4172-checkout" },
 			user: { login: "human-dev" },
 		});
+
+		expect((edgeWorker as any).isQueueableGitHubEvent(event)).toBe(false);
+	});
+
+	it("ignores change requests on already merged Cyrus PRs", () => {
+		process.env.CYRUS_GITHUB_PR_AUTHOR_LOGINS = "funnelcockpit-bot";
+
+		const event = withPullRequest({
+			title: "FC-4442: Translate members area streaming design",
+			body: "Linear issue: FC-4442",
+			head: { ref: "cyrus/fc-4442-membersarea-streaming-design-not-fully" },
+			user: { login: "funnelcockpit-bot" },
+			state: "closed",
+			merged: true,
+			merged_at: "2026-04-29T12:00:00Z",
+		});
+
+		expect((edgeWorker as any).isQueueableGitHubEvent(event)).toBe(false);
+	});
+
+	it("ignores bot mentions on closed PR issues", () => {
+		process.env.GITHUB_BOT_USERNAME = "funnelcockpit-bot";
+
+		const event = {
+			eventType: "issue_comment",
+			deliveryId: "delivery-comment-closed-pr",
+			payload: {
+				action: "created",
+				issue: {
+					number: 99,
+					title: "FC-4442: Translate members area streaming design",
+					body: "Linear issue: FC-4442",
+					state: "closed",
+					pull_request: {
+						url: "https://api.github.com/repos/acme/web/pulls/99",
+						html_url: "https://github.com/acme/web/pull/99",
+						diff_url: "https://github.com/acme/web/pull/99.diff",
+						patch_url: "https://github.com/acme/web/pull/99.patch",
+					},
+				},
+				comment: {
+					id: 123,
+					body: "@funnelcockpit-bot please handle this",
+					user: { login: "reviewer" },
+				},
+				repository: {
+					name: "web",
+					full_name: "acme/web",
+					owner: { login: "acme" },
+				},
+				sender: { login: "reviewer" },
+			},
+		};
 
 		expect((edgeWorker as any).isQueueableGitHubEvent(event)).toBe(false);
 	});
