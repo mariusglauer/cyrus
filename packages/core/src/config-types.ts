@@ -148,6 +148,7 @@ export interface EdgeWorkerRuntimeConfig {
 			options?: {
 				baseBranchOverrides?: Map<string, string>;
 				onRepoSetupHookEvent?: RepoSetupHookEventHandler;
+				normalizeCyrusBranchPrefix?: boolean;
 			},
 		) => Promise<Workspace>;
 

@@ -91,6 +91,7 @@ describe("GitService", () => {
 		vi.clearAllMocks();
 		delete process.env.CYRUS_WORKTREES_DIR;
 		delete process.env.SECRET_TOKEN;
+		delete process.env.CYRUS_BRANCH_PREFIX;
 		vi.spyOn(process.stdout, "write").mockImplementation(() => true);
 		vi.spyOn(process.stderr, "write").mockImplementation(() => true);
 		mockSuccessfulSpawn();
@@ -100,6 +101,7 @@ describe("GitService", () => {
 	afterEach(() => {
 		delete process.env.CYRUS_WORKTREES_DIR;
 		delete process.env.SECRET_TOKEN;
+		delete process.env.CYRUS_BRANCH_PREFIX;
 		vi.restoreAllMocks();
 	});
 
@@ -342,6 +344,43 @@ describe("GitService", () => {
 			expect(new Set(result)).toEqual(
 				new Set(["/repos/repo-a/.git/worktrees/ENG-2", "/repos/repo-a/.git"]),
 			);
+		});
+	});
+
+	describe("resolveIssueBranchName", () => {
+		it("normalizes legacy Cyrus owner prefixes when requested", () => {
+			const issue = makeIssue({
+				branchName: "cyrus2/fc-4416-app-restore-button-is-not-visible",
+			});
+
+			expect(
+				gitService.resolveIssueBranchName(issue, {
+					normalizeCyrusBranchPrefix: true,
+				}),
+			).toBe("cyrus/fc-4416-app-restore-button-is-not-visible");
+		});
+
+		it("preserves existing branch refs when normalization is not requested", () => {
+			const issue = makeIssue({
+				branchName: "cyrus2/fc-4416-app-restore-button-is-not-visible",
+			});
+
+			expect(gitService.resolveIssueBranchName(issue)).toBe(
+				"cyrus2/fc-4416-app-restore-button-is-not-visible",
+			);
+		});
+
+		it("uses a configured canonical Cyrus branch prefix", () => {
+			process.env.CYRUS_BRANCH_PREFIX = "cyrus";
+			const issue = makeIssue({
+				branchName: "cyrus23/fc-4416-app-restore-button-is-not-visible",
+			});
+
+			expect(
+				gitService.resolveIssueBranchName(issue, {
+					normalizeCyrusBranchPrefix: true,
+				}),
+			).toBe("cyrus/fc-4416-app-restore-button-is-not-visible");
 		});
 	});
 

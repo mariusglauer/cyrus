@@ -25,6 +25,12 @@ export interface CreateGitWorktreeOptions {
 	/** Called for repository setup hook lifecycle events. Global setup hooks do not emit events. */
 	onRepoSetupHookEvent?: RepoSetupHookEventHandler;
 	/**
+	 * Normalize Cyrus-owned Linear branch owner prefixes to the configured
+	 * canonical owner. This is intentionally opt-in so GitHub/GitLab follow-up
+	 * sessions can preserve the existing PR/MR branch name exactly.
+	 */
+	normalizeCyrusBranchPrefix?: boolean;
+	/**
 	 * Override workspace base directory. Required for 0-repo workspaces.
 	 * For 1+ repos, defaults to the first repository's workspaceBaseDir.
 	 */
@@ -267,6 +273,45 @@ export class GitService {
 			.replace(/^[.\-/]+/, "") // strip leading dots, dashes, slashes
 			.replace(/[.\-/]+$/, "") // strip trailing dots, dashes, slashes
 			.replace(/-{2,}/g, "-"); // collapse consecutive dashes
+	}
+
+	/**
+	 * Resolve the branch Cyrus should use for an issue.
+	 *
+	 * Linear can return a branch owner prefix based on the assigned agent/user.
+	 * Self-hosted installs sometimes end up with legacy owners such as
+	 * `cyrus2/...`; when normalization is enabled, Cyrus-owned prefixes are
+	 * rewritten to the canonical owner while preserving the issue slug.
+	 */
+	public resolveIssueBranchName(
+		issue: Pick<Issue, "identifier" | "title" | "branchName">,
+		options: { normalizeCyrusBranchPrefix?: boolean } = {},
+	): string {
+		const rawBranchName =
+			issue.branchName ||
+			`${issue.identifier}-${issue.title
+				?.toLowerCase()
+				.replace(/\s+/g, "-")
+				.substring(0, 30)}`;
+		const normalizedBranchName = options.normalizeCyrusBranchPrefix
+			? this.normalizeCyrusBranchPrefix(rawBranchName)
+			: rawBranchName;
+
+		return this.sanitizeBranchName(normalizedBranchName);
+	}
+
+	private normalizeCyrusBranchPrefix(branchName: string): string {
+		const canonicalPrefix = this.getCanonicalCyrusBranchPrefix();
+		return branchName.replace(/^cyrus\d*(?=\/)/i, canonicalPrefix);
+	}
+
+	private getCanonicalCyrusBranchPrefix(): string {
+		const configuredPrefix = process.env.CYRUS_BRANCH_PREFIX?.trim() || "cyrus";
+		const ownerPrefix = configuredPrefix
+			.replace(/^\/+|\/+$/g, "")
+			.split("/")[0]
+			?.trim();
+		return this.sanitizeBranchName(ownerPrefix || "cyrus") || "cyrus";
 	}
 
 	/**
@@ -575,6 +620,7 @@ export class GitService {
 		const {
 			globalSetupScript,
 			onRepoSetupHookEvent,
+			normalizeCyrusBranchPrefix,
 			workspaceBaseDir: overrideBaseDir,
 			baseBranchOverrides,
 		} = options ?? {};
@@ -623,6 +669,7 @@ export class GitService {
 				undefined,
 				overrideValue,
 				onRepoSetupHookEvent,
+				normalizeCyrusBranchPrefix,
 			);
 		}
 
@@ -656,6 +703,7 @@ export class GitService {
 					repoSubPath, // override workspace path for N-repo layout
 					baseBranchOverrides?.get(repository.id),
 					onRepoSetupHookEvent,
+					normalizeCyrusBranchPrefix,
 				);
 				repoPaths[repository.id] = repoWorkspace.path;
 				if (repoWorkspace.resolvedBaseBranches) {
@@ -696,6 +744,7 @@ export class GitService {
 		workspacePathOverride?: string,
 		baseBranchOverride?: string,
 		onRepoSetupHookEvent?: RepoSetupHookEventHandler,
+		normalizeCyrusBranchPrefix = false,
 	): Promise<Workspace> {
 		this.logger.info(
 			`createSingleRepoWorktree for ${repository.name} (id=${repository.id}): baseBranchOverride=${baseBranchOverride ?? "undefined"}`,
@@ -723,14 +772,10 @@ export class GitService {
 				throw new Error("Not a git repository");
 			}
 
-			// Use Linear's preferred branch name, or generate one if not available
-			const rawBranchName =
-				issue.branchName ||
-				`${issue.identifier}-${issue.title
-					?.toLowerCase()
-					.replace(/\s+/g, "-")
-					.substring(0, 30)}`;
-			const branchName = this.sanitizeBranchName(rawBranchName);
+			// Use Linear's preferred branch name, or generate one if not available.
+			const branchName = this.resolveIssueBranchName(issue, {
+				normalizeCyrusBranchPrefix,
+			});
 			const workspacePath =
 				workspacePathOverride ??
 				join(repository.workspaceBaseDir, issue.identifier);

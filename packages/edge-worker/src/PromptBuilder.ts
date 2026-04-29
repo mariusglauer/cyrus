@@ -873,7 +873,9 @@ Focus on addressing the specific request in the mention. You can use the Linear 
 				.replace(/{{base_branch}}/g, baseBranch)
 				.replace(
 					/{{branch_name}}/g,
-					this.gitService.sanitizeBranchName(issue.branchName),
+					this.gitService.resolveIssueBranchName(issue, {
+						normalizeCyrusBranchPrefix: true,
+					}),
 				)
 				.replace(/{{assignee_name}}/g, assigneeName)
 				.replace(/{{assignee_linear_profile_url}}/g, assigneeLinearProfileUrl)
@@ -985,6 +987,9 @@ IMPORTANT: Focus specifically on addressing the new comment above. This is a new
 					return `Repository: ${repo.name}\nWorking directory: ${repo.repositoryPath}\nBase branch: ${branch}`;
 				})
 				.join("\n\n");
+			const issueBranchName = this.gitService.resolveIssueBranchName(issue, {
+				normalizeCyrusBranchPrefix: true,
+			});
 
 			const fallbackPrompt = `Please help me with the following Linear issue:
 
@@ -994,7 +999,7 @@ Title: ${issue.title}
 Description: ${issue.description || "No description provided"}
 State: ${stateName}
 Priority: ${issue.priority?.toString() || "None"}
-Branch: ${issue.branchName}
+Branch: ${issueBranchName}
 
 ${newComment ? `New comment to address:\n${newComment.body}\n\n` : ""}Please analyze this issue and help implement a solution.`;
 
@@ -1534,7 +1539,9 @@ ${reply.body}
 			identifier: issue.identifier,
 			title: issue.title || "",
 			description: issue.description || undefined,
-			branchName: issue.branchName, // Use the real branchName property!
+			branchName: this.gitService.resolveIssueBranchName(issue, {
+				normalizeCyrusBranchPrefix: true,
+			}),
 		};
 	}
 

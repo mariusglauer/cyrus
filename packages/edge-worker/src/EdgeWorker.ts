@@ -6196,6 +6196,7 @@ ${taskSection}`;
 							linearWorkspaceId,
 							activity,
 						),
+					normalizeCyrusBranchPrefix: true,
 				})
 			: await this.gitService.createGitWorktree(fullIssue, repositories, {
 					baseBranchOverrides,
@@ -6205,6 +6206,7 @@ ${taskSection}`;
 							linearWorkspaceId,
 							activity,
 						),
+					normalizeCyrusBranchPrefix: true,
 				});
 
 		this.logger.debug(`Workspace created at: ${workspace.path}`);

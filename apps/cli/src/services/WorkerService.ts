@@ -253,12 +253,14 @@ export class WorkerService {
 					options?: {
 						baseBranchOverrides?: Map<string, string>;
 						onRepoSetupHookEvent?: RepoSetupHookEventHandler;
+						normalizeCyrusBranchPrefix?: boolean;
 					},
 				): Promise<Workspace> => {
 					return this.gitService.createGitWorktree(issue, repositories, {
 						globalSetupScript: edgeConfig.global_setup_script,
 						baseBranchOverrides: options?.baseBranchOverrides,
 						onRepoSetupHookEvent: options?.onRepoSetupHookEvent,
+						normalizeCyrusBranchPrefix: options?.normalizeCyrusBranchPrefix,
 					});
 				},
 				onOAuthCallback,
