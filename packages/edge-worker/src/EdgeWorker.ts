@@ -2188,9 +2188,7 @@ export class EdgeWorker extends EventEmitter {
 		return true;
 	}
 
-	private isGitHubPullRequestTerminal(
-		pullRequest: GitHubPullRequest,
-	): boolean {
+	private isGitHubPullRequestTerminal(pullRequest: GitHubPullRequest): boolean {
 		const terminalState = pullRequest.state?.toLowerCase() === "closed";
 		const mergeMetadata = pullRequest as GitHubPullRequest & {
 			merged?: boolean;
@@ -2541,6 +2539,8 @@ export class EdgeWorker extends EventEmitter {
 						repositoryId: repository.id,
 						branchName: branchRef,
 						baseBranchName: baseBranchRef ?? repository.baseBranch,
+						githubUrl: repository.githubUrl,
+						githubReviewTeams: repository.githubReviewTeams,
 					},
 				],
 			);
@@ -6244,6 +6244,8 @@ ${taskSection}`;
 			branchName: issueMinimal.branchName,
 			baseBranchName:
 				workspace.resolvedBaseBranches?.[repo.id]?.branch ?? repo.baseBranch,
+			githubUrl: repo.githubUrl,
+			githubReviewTeams: repo.githubReviewTeams,
 		}));
 
 		agentSessionManager.createCyrusAgentSession(

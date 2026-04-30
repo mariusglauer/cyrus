@@ -61,6 +61,13 @@ git push -u origin HEAD
 gh pr view --json url,number 2>/dev/null || gh pr create --base [base_branch from context] --title "[descriptive title]" --body "Ready for review"
 ```
 
+If the prompt includes a `<github-review-request>` block with team reviewers, request review after the PR exists:
+
+```bash
+# Use owner/team for GitHub teams. If a team is listed without owner, derive owner from <github_url>.
+gh pr edit --add-reviewer owner/team-slug
+```
+
 ### GitLab (when `<gitlab_url>` is present)
 
 ```bash

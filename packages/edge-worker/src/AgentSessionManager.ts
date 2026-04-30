@@ -609,6 +609,11 @@ export class AgentSessionManager extends EventEmitter {
 				session,
 				resultMessage,
 			});
+			await this.requestConfiguredGitHubTeamReviews(
+				repoDir,
+				pullRequestUrl,
+				session,
+			);
 			await this.publishFrontendScreenshotsForPullRequest(
 				sessionId,
 				repoDir,
@@ -1394,6 +1399,106 @@ export class AgentSessionManager extends EventEmitter {
 				`Pull request head is ${pullRequest.headRefName}, expected ${options.branch}: ${pullRequestUrl}`,
 			);
 		}
+	}
+
+	private async requestConfiguredGitHubTeamReviews(
+		repoDir: string,
+		pullRequestUrl: string,
+		session: CyrusAgentSession,
+	): Promise<void> {
+		const configuredTeams = this.getConfiguredGitHubReviewTeams(session);
+		if (!configuredTeams.length) {
+			return;
+		}
+
+		const owner =
+			this.getConfiguredGitHubReviewOwner(session) ??
+			(await this.getGitHubRemoteOwner(repoDir));
+		const reviewers = this.formatGitHubTeamReviewers(configuredTeams, owner);
+		if (!reviewers.length) {
+			return;
+		}
+
+		try {
+			await this.runWorkspaceCommand(repoDir, "gh", [
+				"pr",
+				"edit",
+				pullRequestUrl,
+				"--add-reviewer",
+				reviewers.join(","),
+			]);
+			this.sessionLog(session.id).info(
+				`Requested GitHub review from team(s): ${reviewers.join(", ")}`,
+			);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			this.sessionLog(session.id).warn(
+				`Failed to request GitHub team review(s) ${reviewers.join(", ")}: ${message}`,
+			);
+			await this.postOperationalAlert({
+				key: `github-review-request-failed:${pullRequestUrl}`,
+				severity: "warning",
+				title: "GitHub team review request failed",
+				message: `Could not request GitHub review from ${reviewers.join(", ")} for ${pullRequestUrl}: ${message}`,
+			});
+		}
+	}
+
+	private getConfiguredGitHubReviewTeams(session: CyrusAgentSession): string[] {
+		const teams = session.repositories.flatMap(
+			(repository) => repository.githubReviewTeams ?? [],
+		);
+		return [...new Set(teams.map((team) => team.trim()).filter(Boolean))];
+	}
+
+	private getConfiguredGitHubReviewOwner(
+		session: CyrusAgentSession,
+	): string | undefined {
+		for (const repository of session.repositories) {
+			if (!repository.githubUrl) {
+				continue;
+			}
+			const owner = this.extractGitHubOwnerFromRemote(repository.githubUrl);
+			if (owner) {
+				return owner;
+			}
+		}
+		return undefined;
+	}
+
+	private formatGitHubTeamReviewers(teams: string[], owner?: string): string[] {
+		return teams
+			.map((team) => team.trim())
+			.filter(Boolean)
+			.map((team) => {
+				if (team.includes("/") || !owner) {
+					return team;
+				}
+				return `${owner}/${team}`;
+			});
+	}
+
+	private async getGitHubRemoteOwner(
+		repoDir: string,
+	): Promise<string | undefined> {
+		const result = await this.tryWorkspaceCommand(repoDir, "git", [
+			"config",
+			"--get",
+			"remote.origin.url",
+		]);
+		const remoteUrl = result?.stdout.trim();
+		if (!remoteUrl) {
+			return undefined;
+		}
+
+		return this.extractGitHubOwnerFromRemote(remoteUrl);
+	}
+
+	private extractGitHubOwnerFromRemote(remoteUrl: string): string | undefined {
+		const match = remoteUrl.match(
+			/(?:github\.com[:/])([^/\s:]+)\/[^/\s]+?(?:\.git)?$/,
+		);
+		return match?.[1];
 	}
 
 	private async getPullRequestInfo(

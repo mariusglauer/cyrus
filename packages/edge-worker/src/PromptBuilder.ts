@@ -963,6 +963,11 @@ IMPORTANT: Focus specifically on addressing the new comment above. This is a new
 					);
 					prompt = `${prompt}\n\n<repository-specific-instruction repository="${repo.name}">\n${repo.appendInstruction}\n</repository-specific-instruction>`;
 				}
+
+				const reviewRequest = this.formatGitHubReviewRequestInstruction(repo);
+				if (reviewRequest) {
+					prompt = `${prompt}\n\n${reviewRequest}`;
+				}
 			}
 
 			this.logger.debug(`Final prompt length: ${prompt.length} characters`);
@@ -1005,6 +1010,41 @@ ${newComment ? `New comment to address:\n${newComment.body}\n\n` : ""}Please ana
 
 			return { prompt: fallbackPrompt, version: undefined };
 		}
+	}
+
+	private formatGitHubReviewRequestInstruction(
+		repository: RepositoryConfig,
+	): string {
+		const teams = this.normalizeList(repository.githubReviewTeams);
+		if (!teams.length || !repository.githubUrl) {
+			return "";
+		}
+
+		const teamLines = teams
+			.map((team) => `    <team>${this.escapeXml(team)}</team>`)
+			.join("\n");
+		return `<github-review-request repository="${this.escapeXml(repository.name)}">
+  <github_url>${this.escapeXml(repository.githubUrl)}</github_url>
+  <teams>
+${teamLines}
+  </teams>
+  <instruction>After creating or updating a GitHub PR for this repository, request reviews from these GitHub team reviewer(s). If a team value does not include an organization prefix, derive the organization from the repository owner in github_url and request review from owner/team.</instruction>
+</github-review-request>`;
+	}
+
+	private normalizeList(values: string[] | undefined): string[] {
+		return [
+			...new Set((values ?? []).map((value) => value.trim()).filter(Boolean)),
+		];
+	}
+
+	private escapeXml(value: string): string {
+		return value
+			.replace(/&/g, "&amp;")
+			.replace(/</g, "&lt;")
+			.replace(/>/g, "&gt;")
+			.replace(/"/g, "&quot;")
+			.replace(/'/g, "&apos;");
 	}
 
 	/**

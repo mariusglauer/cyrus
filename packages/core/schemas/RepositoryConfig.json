@@ -21,6 +21,12 @@
 		"gitlabUrl": {
 			"type": "string"
 		},
+		"githubReviewTeams": {
+			"type": "array",
+			"items": {
+				"type": "string"
+			}
+		},
 		"linearWorkspaceId": {
 			"type": "string"
 		},

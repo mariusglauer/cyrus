@@ -65,6 +65,10 @@ export interface RepositoryContext {
 	branchName?: string;
 	/** The base branch for PRs (e.g., "main" or a Graphite parent branch) */
 	baseBranchName?: string;
+	/** GitHub repository URL from repository config, if available. */
+	githubUrl?: string;
+	/** GitHub team slugs to request as reviewers for PRs created by this session. */
+	githubReviewTeams?: string[];
 }
 
 export interface CyrusAgentSession {

@@ -279,6 +279,8 @@ export const RepositoryConfigSchema = z.object({
 	baseBranch: z.string(),
 	githubUrl: z.string().optional(),
 	gitlabUrl: z.string().optional(),
+	/** GitHub team slugs to request as reviewers after PR creation/update. */
+	githubReviewTeams: z.array(z.string()).optional(),
 
 	// Linear configuration (optional — repos may operate without Linear, e.g. via Slack or GitHub)
 	linearWorkspaceId: z.string().optional(),
