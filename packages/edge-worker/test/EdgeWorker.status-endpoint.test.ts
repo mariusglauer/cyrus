@@ -103,7 +103,10 @@ describe("EdgeWorker - Status Endpoint", () => {
 			cyrusHome: "/test/.cyrus",
 			repositories: [mockRepository],
 			linearWorkspaces: {
-				"test-workspace": { linearToken: "test-token" },
+				"test-workspace": {
+					linearToken: "test-token",
+					linearWorkspaceSlug: "funnelcockpit",
+				},
 			},
 		};
 	});
@@ -270,6 +273,131 @@ describe("EdgeWorker - Status Endpoint", () => {
 	});
 
 	describe("durable queue recovery", () => {
+		it("moves a queued task to the front when prioritized", async () => {
+			edgeWorker = new EdgeWorker(mockConfig);
+			const now = Date.now();
+			const firstItem = {
+				origin: "linear",
+				sessionId: "linear-session-1",
+				workItemIdentifier: "FC-4410",
+				queuedAt: now - 5_000,
+				availableAt: now + 60_000,
+				retryCount: 0,
+				repoIds: ["test-repo"],
+				webhook: {
+					organizationId: "test-workspace",
+					agentSession: {
+						id: "linear-session-1",
+						issue: { id: "issue-1", identifier: "FC-4410" },
+					},
+				},
+			};
+			const secondItem = {
+				origin: "github",
+				sessionId: "github-delivery-1",
+				workItemIdentifier: "funnelcockpit/funnelcockpit#363",
+				queuedAt: now - 2_000,
+				availableAt: now + 120_000,
+				retryCount: 0,
+				githubRepositoryId: "test-repo",
+				githubEvent: {
+					deliveryId: "delivery-1",
+					payload: {
+						issue: {
+							number: 363,
+							title: "FC-4411: Follow-up",
+							html_url:
+								"https://github.com/funnelcockpit/funnelcockpit/pull/363",
+							pull_request: {},
+						},
+						comment: {
+							body: "@cyrus please update this",
+							user: { login: "marius" },
+						},
+						repository: {
+							name: "funnelcockpit",
+							full_name: "funnelcockpit/funnelcockpit",
+							owner: { login: "funnelcockpit" },
+						},
+						sender: { login: "marius" },
+					},
+				},
+			};
+
+			(edgeWorker as any).linearSessionQueue = [firstItem, secondItem];
+			(edgeWorker as any).saveLinearSessionQueue = vi
+				.fn()
+				.mockResolvedValue(undefined);
+			(edgeWorker as any).drainLinearSessionQueue = vi.fn();
+
+			const result = await (edgeWorker as any).prioritizeAgentQueueItem(
+				"github-delivery-1",
+			);
+
+			expect(result.statusCode).toBe(200);
+			expect((edgeWorker as any).linearSessionQueue[0].sessionId).toBe(
+				"github-delivery-1",
+			);
+			expect(
+				(edgeWorker as any).linearSessionQueue[0].availableAt,
+			).toBeLessThanOrEqual(Date.now());
+			expect((edgeWorker as any).linearSessionQueue[0].prioritizedAt).toEqual(
+				expect.any(Number),
+			);
+			expect((edgeWorker as any).saveLinearSessionQueue).toHaveBeenCalled();
+			expect((edgeWorker as any).drainLinearSessionQueue).toHaveBeenCalled();
+		});
+
+		it("includes the related Linear issue link for queued GitHub tasks", () => {
+			edgeWorker = new EdgeWorker(mockConfig);
+			(edgeWorker as any).linearSessionQueue = [
+				{
+					origin: "github",
+					sessionId: "github-delivery-1",
+					workItemIdentifier: "funnelcockpit/funnelcockpit#363",
+					queuedAt: Date.now(),
+					availableAt: Date.now(),
+					retryCount: 0,
+					githubRepositoryId: "test-repo",
+					githubEvent: {
+						deliveryId: "delivery-1",
+						payload: {
+							issue: {
+								number: 363,
+								title: "FC-4411: Follow-up",
+								html_url:
+									"https://github.com/funnelcockpit/funnelcockpit/pull/363",
+								pull_request: {},
+							},
+							comment: {
+								body: "@cyrus please update this",
+								user: { login: "marius" },
+							},
+							repository: {
+								name: "funnelcockpit",
+								full_name: "funnelcockpit/funnelcockpit",
+								owner: { login: "funnelcockpit" },
+							},
+							sender: { login: "marius" },
+						},
+					},
+				},
+			];
+
+			const status = (edgeWorker as any).buildLinearQueueStatus();
+
+			expect(status.pendingItems[0]).toEqual(
+				expect.objectContaining({
+					issueIdentifier: "funnelcockpit/funnelcockpit#363",
+					workItemUrl:
+						"https://github.com/funnelcockpit/funnelcockpit/pull/363",
+					linearIssueIdentifier: "FC-4411",
+					linearIssueUrl: "https://linear.app/funnelcockpit/issue/FC-4411",
+					canPrioritize: true,
+				}),
+			);
+		});
+
 		it("requeues restored active Linear sessions that no longer have a runner", async () => {
 			edgeWorker = new EdgeWorker(mockConfig);
 			(edgeWorker as any).saveLinearSessionQueue = vi
@@ -472,9 +600,10 @@ describe("EdgeWorker - Status Endpoint", () => {
 	describe("registerStatusEndpoint", () => {
 		it("should register GET /status endpoint with Fastify", async () => {
 			const mockGet = vi.fn();
+			const mockPost = vi.fn();
 			const mockFastify = {
 				get: mockGet,
-				post: vi.fn(),
+				post: mockPost,
 			};
 
 			// Create EdgeWorker with mock that captures the registered handler
@@ -500,6 +629,10 @@ describe("EdgeWorker - Status Endpoint", () => {
 
 			// Verify GET /status was registered
 			expect(mockGet).toHaveBeenCalledWith("/status", expect.any(Function));
+			expect(mockPost).toHaveBeenCalledWith(
+				"/agent-queue/:sessionId/prioritize",
+				expect.any(Function),
+			);
 		});
 
 		it("should return idle status via the endpoint handler", async () => {

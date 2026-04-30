@@ -213,6 +213,7 @@ type AgentSessionQueueItem = {
 	retryCount: number;
 	lastError?: string;
 	startedAt?: number;
+	prioritizedAt?: number;
 	recoveredAt?: number;
 	webhook?: AgentSessionCreatedWebhook;
 	repoIds?: string[];
@@ -1103,10 +1104,45 @@ export class EdgeWorker extends EventEmitter {
 			return reply.status(200).send(this.buildLinearQueueStatus());
 		});
 
+		fastify.post(
+			"/agent-queue/:sessionId/prioritize",
+			async (request, reply) => {
+				const params = request.params as { sessionId?: string };
+				const sessionId = params.sessionId?.trim();
+				if (!sessionId) {
+					return reply.status(400).send({
+						ok: false,
+						error: "Missing queue session id.",
+					});
+				}
+
+				const result = await this.prioritizeAgentQueueItem(sessionId);
+				return reply.status(result.statusCode).send(result.body);
+			},
+		);
+
+		fastify.post(
+			"/linear-queue/:sessionId/prioritize",
+			async (request, reply) => {
+				const params = request.params as { sessionId?: string };
+				const sessionId = params.sessionId?.trim();
+				if (!sessionId) {
+					return reply.status(400).send({
+						ok: false,
+						error: "Missing queue session id.",
+					});
+				}
+
+				const result = await this.prioritizeAgentQueueItem(sessionId);
+				return reply.status(result.statusCode).send(result.body);
+			},
+		);
+
 		this.logger.info("✅ Status endpoint registered");
 		this.logger.info("   Route: GET /status");
 		this.logger.info("   Route: GET /linear-queue");
 		this.logger.info("   Route: GET /agent-queue");
+		this.logger.info("   Route: POST /agent-queue/:sessionId/prioritize");
 	}
 
 	private renderDashboardHtml(): string {
@@ -1250,7 +1286,7 @@ export class EdgeWorker extends EventEmitter {
 		table {
 			width: 100%;
 			border-collapse: collapse;
-			min-width: 720px;
+			min-width: 920px;
 		}
 
 		th,
@@ -1287,6 +1323,31 @@ export class EdgeWorker extends EventEmitter {
 		a:hover { text-decoration: underline; }
 		a code { color: inherit; }
 
+		button {
+			display: inline-flex;
+			align-items: center;
+			justify-content: center;
+			min-height: 30px;
+			padding: 4px 9px;
+			border: 1px solid var(--line);
+			border-radius: 6px;
+			background: var(--panel-soft);
+			color: var(--text);
+			font: inherit;
+			font-weight: 600;
+			cursor: pointer;
+		}
+
+		button:hover:not(:disabled) {
+			border-color: var(--accent);
+			color: var(--accent);
+		}
+
+		button:disabled {
+			cursor: wait;
+			opacity: 0.65;
+		}
+
 		.empty {
 			padding: 18px 0;
 			color: var(--muted);
@@ -1311,6 +1372,14 @@ export class EdgeWorker extends EventEmitter {
 		}
 
 		.error-text { color: var(--danger); }
+
+		.queue-message {
+			margin: -2px 0 10px;
+			color: var(--muted);
+			min-height: 20px;
+		}
+
+		.queue-message.error-text { color: var(--danger); }
 
 		@media (max-width: 900px) {
 			.metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -1352,6 +1421,7 @@ export class EdgeWorker extends EventEmitter {
 
 		<section class="section">
 			<h2>Waiting Queue</h2>
+			<div class="queue-message" id="queueMessage"></div>
 			<div id="pendingTasks"></div>
 		</section>
 
@@ -1378,6 +1448,7 @@ export class EdgeWorker extends EventEmitter {
 			cooldown: document.getElementById("cooldown"),
 			activeTasks: document.getElementById("activeTasks"),
 			pendingTasks: document.getElementById("pendingTasks"),
+			queueMessage: document.getElementById("queueMessage"),
 			recentAlerts: document.getElementById("recentAlerts"),
 			config: document.getElementById("config"),
 		};
@@ -1423,6 +1494,11 @@ export class EdgeWorker extends EventEmitter {
 				const tr = document.createElement("tr");
 				for (const column of columns) {
 					const td = document.createElement("td");
+					if (column.render) {
+						column.render(row, td);
+						tr.appendChild(td);
+						continue;
+					}
 					const value = column.value(row);
 					const href = column.href ? column.href(row) : "";
 					let target = td;
@@ -1452,6 +1528,33 @@ export class EdgeWorker extends EventEmitter {
 			return wrap;
 		}
 
+		async function prioritizeTask(sessionId, button) {
+			if (!sessionId || !button) return;
+			const originalText = button.textContent;
+			button.disabled = true;
+			button.textContent = "Moving";
+			els.queueMessage.className = "queue-message";
+			els.queueMessage.textContent = "";
+
+			try {
+				const response = await fetch("/agent-queue/" + encodeURIComponent(sessionId) + "/prioritize", {
+					method: "POST",
+					headers: { "accept": "application/json" },
+				});
+				const payload = await response.json().catch(() => ({}));
+				if (!response.ok || payload.ok === false) {
+					throw new Error(payload.error || "HTTP " + response.status);
+				}
+				els.queueMessage.textContent = payload.message || "Task moved to the front of the queue.";
+				await load();
+			} catch (error) {
+				els.queueMessage.className = "queue-message error-text";
+				els.queueMessage.textContent = "Failed to prioritize task: " + error.message;
+				button.disabled = false;
+				button.textContent = originalText;
+			}
+		}
+
 		function setChildren(node, child) {
 			node.replaceChildren(child);
 		}
@@ -1475,6 +1578,7 @@ export class EdgeWorker extends EventEmitter {
 					[
 						{ label: "Origin", value: (row) => row.origin },
 						{ label: "Task / PR", value: (row) => row.issueIdentifier, href: (row) => row.workItemUrl, code: true },
+						{ label: "Linear", value: (row) => row.linearIssueIdentifier, href: (row) => row.linearIssueUrl, code: true },
 						{ label: "Session", value: (row) => row.sessionId, code: true },
 						{ label: "Retry", value: (row) => row.retryCount },
 						{ label: "Queued", value: (row) => formatDuration(row.queuedForMs) },
@@ -1493,10 +1597,22 @@ export class EdgeWorker extends EventEmitter {
 						{ label: "#", value: (row) => row.position },
 						{ label: "Origin", value: (row) => row.origin },
 						{ label: "Task / PR", value: (row) => row.issueIdentifier, href: (row) => row.workItemUrl, code: true },
+						{ label: "Linear", value: (row) => row.linearIssueIdentifier, href: (row) => row.linearIssueUrl, code: true },
 						{ label: "Session", value: (row) => row.sessionId, code: true },
 						{ label: "Retry", value: (row) => row.retryCount },
 						{ label: "Queued", value: (row) => formatDuration(row.queuedForMs) },
 						{ label: "Available in", value: (row) => formatDuration(row.availableInMs) },
+						{
+							label: "Action",
+							render: (row, td) => {
+								const button = document.createElement("button");
+								button.type = "button";
+								button.textContent = row.position === 1 ? "Top" : "Prioritize";
+								button.disabled = !row.canPrioritize || row.position === 1;
+								button.addEventListener("click", () => prioritizeTask(row.sessionId, button));
+								td.appendChild(button);
+							},
+						},
 						{ label: "Recovered", value: (row) => row.recoveredAt || "-" },
 						{ label: "Last error", value: (row) => row.lastError },
 					],
@@ -3867,9 +3983,15 @@ ${taskSection}`;
 					sessionId: item.sessionId,
 					issueIdentifier: item.workItemIdentifier,
 					workItemUrl: this.getAgentQueueItemUrl(item),
+					linearIssueIdentifier:
+						this.getAgentQueueItemLinearIssueIdentifier(item),
+					linearIssueUrl: this.getAgentQueueItemLinearIssueUrl(item),
 					retryCount: item.retryCount,
 					queuedForMs: Math.max(0, now - item.queuedAt),
 					runningForMs: item.startedAt ? Math.max(0, now - item.startedAt) : 0,
+					prioritizedAt: item.prioritizedAt
+						? new Date(item.prioritizedAt).toISOString()
+						: null,
 					recoveredAt: item.recoveredAt
 						? new Date(item.recoveredAt).toISOString()
 						: null,
@@ -3885,9 +4007,16 @@ ${taskSection}`;
 				sessionId: item.sessionId,
 				issueIdentifier: item.workItemIdentifier,
 				workItemUrl: this.getAgentQueueItemUrl(item),
+				linearIssueIdentifier:
+					this.getAgentQueueItemLinearIssueIdentifier(item),
+				linearIssueUrl: this.getAgentQueueItemLinearIssueUrl(item),
+				canPrioritize: true,
 				retryCount: item.retryCount,
 				queuedForMs: Math.max(0, now - item.queuedAt),
 				availableInMs: Math.max(0, item.availableAt - now),
+				prioritizedAt: item.prioritizedAt
+					? new Date(item.prioritizedAt).toISOString()
+					: null,
 				recoveredAt: item.recoveredAt
 					? new Date(item.recoveredAt).toISOString()
 					: null,
@@ -3896,6 +4025,72 @@ ${taskSection}`;
 					: null,
 				lastError: item.lastError,
 			})),
+		};
+	}
+
+	private async prioritizeAgentQueueItem(sessionId: string): Promise<{
+		statusCode: number;
+		body: {
+			ok: boolean;
+			message?: string;
+			error?: string;
+			item?: { sessionId: string; workItemIdentifier: string; origin: string };
+			queue?: ReturnType<EdgeWorker["buildLinearQueueStatus"]>;
+		};
+	}> {
+		const index = this.linearSessionQueue.findIndex(
+			(item) => item.sessionId === sessionId,
+		);
+		if (index === -1) {
+			if (this.linearSessionActiveItems.has(sessionId)) {
+				return {
+					statusCode: 409,
+					body: {
+						ok: false,
+						error: "Task is already active and cannot be reprioritized.",
+					},
+				};
+			}
+
+			return {
+				statusCode: 404,
+				body: {
+					ok: false,
+					error: "Task was not found in the waiting queue.",
+				},
+			};
+		}
+
+		const now = Date.now();
+		const [item] = this.linearSessionQueue.splice(index, 1);
+		if (!item) {
+			return {
+				statusCode: 404,
+				body: {
+					ok: false,
+					error: "Task was not found in the waiting queue.",
+				},
+			};
+		}
+
+		item.availableAt = Math.min(item.availableAt, now);
+		item.prioritizedAt = now;
+		this.linearSessionQueue.unshift(item);
+		await this.saveLinearSessionQueue();
+		this.drainLinearSessionQueue();
+
+		return {
+			statusCode: 200,
+			body: {
+				ok: true,
+				message: `${item.workItemIdentifier} was moved to the front of the queue.`,
+				item: {
+					sessionId: item.sessionId,
+					workItemIdentifier: item.workItemIdentifier,
+					origin: item.origin,
+				},
+				queue: this.buildLinearQueueStatus(),
+			},
 		};
 	}
 
@@ -3911,12 +4106,57 @@ ${taskSection}`;
 		return null;
 	}
 
+	private getAgentQueueItemLinearIssueIdentifier(
+		item: AgentSessionQueueItem,
+	): string | null {
+		if (item.origin === "linear") {
+			return this.getLinearQueueItemIdentifier(item);
+		}
+
+		if (item.origin === "github" && item.githubEvent) {
+			return (
+				this.extractLinearIssueIdentifierFromGitHubEvent(item.githubEvent) ??
+				null
+			);
+		}
+
+		return null;
+	}
+
+	private getAgentQueueItemLinearIssueUrl(
+		item: AgentSessionQueueItem,
+	): string | null {
+		const identifier = this.getAgentQueueItemLinearIssueIdentifier(item);
+		return identifier
+			? this.getLinearIssueUrlForIdentifier(item, identifier)
+			: null;
+	}
+
 	private getLinearQueueItemUrl(item: AgentSessionQueueItem): string | null {
+		const issue = item.webhook?.agentSession?.issue as
+			| { url?: unknown }
+			| undefined;
+		if (typeof issue?.url === "string" && issue.url.trim()) {
+			return issue.url.trim();
+		}
+
+		const identifier = this.getLinearQueueItemIdentifier(item);
+		return identifier
+			? this.getLinearIssueUrlForIdentifier(item, identifier)
+			: null;
+	}
+
+	private getLinearQueueItemIdentifier(
+		item: AgentSessionQueueItem,
+	): string | null {
 		const issue = item.webhook?.agentSession?.issue as
 			| { url?: unknown; identifier?: unknown }
 			| undefined;
 		if (typeof issue?.url === "string" && issue.url.trim()) {
-			return issue.url.trim();
+			const identifier = this.extractLinearIssueIdentifierFromText(issue.url);
+			if (identifier) {
+				return identifier;
+			}
 		}
 
 		const identifier =
@@ -3927,17 +4167,48 @@ ${taskSection}`;
 			return null;
 		}
 
+		return identifier.toUpperCase();
+	}
+
+	private getLinearIssueUrlForIdentifier(
+		item: AgentSessionQueueItem,
+		identifier: string,
+	): string | null {
 		const workspaceSlug = this.getLinearWorkspaceSlugForQueueItem(item);
 		if (!workspaceSlug) {
 			return null;
 		}
 
-		return `https://linear.app/${encodeURIComponent(workspaceSlug)}/issue/${encodeURIComponent(identifier)}`;
+		return `https://linear.app/${encodeURIComponent(workspaceSlug)}/issue/${encodeURIComponent(identifier.toUpperCase())}`;
 	}
 
 	private getLinearWorkspaceSlugForQueueItem(
 		item: AgentSessionQueueItem,
 	): string | undefined {
+		if (item.githubRepositoryId) {
+			const repository = this.repositories.get(item.githubRepositoryId);
+			const workspaceSlug = repository?.linearWorkspaceId
+				? this.config.linearWorkspaces?.[repository.linearWorkspaceId]
+						?.linearWorkspaceSlug
+				: undefined;
+			if (workspaceSlug) {
+				return workspaceSlug;
+			}
+		}
+
+		if (item.origin === "github" && item.githubEvent) {
+			const repository = this.findRepositoryByGitHubUrl(
+				extractRepoFullName(item.githubEvent),
+			);
+			const workspaceSlug = repository?.linearWorkspaceId
+				? this.config.linearWorkspaces?.[repository.linearWorkspaceId]
+						?.linearWorkspaceSlug
+				: undefined;
+			if (workspaceSlug) {
+				return workspaceSlug;
+			}
+		}
+
 		const webhook = item.webhook as { organizationId?: unknown } | undefined;
 		const organizationId =
 			typeof webhook?.organizationId === "string"
@@ -7062,6 +7333,9 @@ ${taskSection}`;
 							? "Recovered after Cyrus restart; retrying automatically."
 							: item.lastError,
 						recoveredAt: wasRunning ? now : item.recoveredAt,
+						prioritizedAt: Number.isFinite(item.prioritizedAt)
+							? item.prioritizedAt
+							: undefined,
 						startedAt: undefined,
 					};
 				});
