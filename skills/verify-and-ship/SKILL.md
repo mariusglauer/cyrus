@@ -64,8 +64,8 @@ gh pr view --json url,number 2>/dev/null || gh pr create --base [base_branch fro
 If the prompt includes a `<github-review-request>` block with team reviewers, request review after the PR exists:
 
 ```bash
-# Use owner/team for GitHub teams. If a team is listed without owner, derive owner from <github_url>.
-gh pr edit --add-reviewer owner/team-slug
+# Use the team slug without the owner/org prefix for team_reviewers[].
+gh api --method POST repos/OWNER/REPO/pulls/PR_NUMBER/requested_reviewers -f team_reviewers[]=team-slug
 ```
 
 ### GitLab (when `<gitlab_url>` is present)

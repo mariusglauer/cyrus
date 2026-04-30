@@ -19,30 +19,40 @@ describe("AgentSessionManager - GitHub review teams", () => {
 		).toEqual(["engineering"]);
 	});
 
-	it("extracts GitHub owners from SSH and HTTPS remotes", () => {
+	it("normalizes team reviewer slugs for the GitHub API", () => {
 		expect(
-			(manager as any).extractGitHubOwnerFromRemote(
-				"git@github.com:funnelcockpit/funnelcockpit.git",
-			),
-		).toBe("funnelcockpit");
-		expect(
-			(manager as any).extractGitHubOwnerFromRemote(
-				"https://github.com/funnelcockpit/funnelcockpit.git",
-			),
-		).toBe("funnelcockpit");
+			(manager as any).formatGitHubTeamReviewSlugs([
+				"engineering",
+				"funnelcockpit/security",
+				"funnelcockpit/engineering",
+				"",
+			]),
+		).toEqual(["engineering", "security"]);
 	});
 
-	it("uses the configured GitHub URL to resolve the owner", () => {
+	it("parses GitHub pull request URLs for API review requests", () => {
 		expect(
-			(manager as any).getConfiguredGitHubReviewOwner({
-				repositories: [
-					{
-						repositoryId: "funnelcockpit",
-						githubUrl: "https://github.com/funnelcockpit/funnelcockpit",
-						githubReviewTeams: ["engineering"],
-					},
-				],
-			}),
-		).toBe("funnelcockpit");
+			(manager as any).parseGitHubPullRequestUrl(
+				"https://github.com/funnelcockpit/funnelcockpit/pull/363",
+			),
+		).toEqual({
+			owner: "funnelcockpit",
+			repo: "funnelcockpit",
+			number: "363",
+		});
+		expect(
+			(manager as any).parseGitHubPullRequestUrl(
+				"https://github.com/funnelcockpit/funnelcockpit/pull/363#issuecomment-1",
+			),
+		).toEqual({
+			owner: "funnelcockpit",
+			repo: "funnelcockpit",
+			number: "363",
+		});
+		expect(
+			(manager as any).parseGitHubPullRequestUrl(
+				"git@github.com:funnelcockpit/funnelcockpit.git",
+			),
+		).toBeUndefined();
 	});
 });

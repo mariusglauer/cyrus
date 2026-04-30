@@ -1411,22 +1411,41 @@ export class AgentSessionManager extends EventEmitter {
 			return;
 		}
 
-		const owner =
-			this.getConfiguredGitHubReviewOwner(session) ??
-			(await this.getGitHubRemoteOwner(repoDir));
-		const reviewers = this.formatGitHubTeamReviewers(configuredTeams, owner);
-		if (!reviewers.length) {
+		const pullRequest = this.parseGitHubPullRequestUrl(pullRequestUrl);
+		if (!pullRequest) {
+			this.sessionLog(session.id).warn(
+				`Cannot request GitHub team review(s) for unrecognized PR URL: ${pullRequestUrl}`,
+			);
+			await this.postOperationalAlert({
+				key: `github-review-request-invalid-url:${pullRequestUrl}`,
+				severity: "warning",
+				title: "GitHub team review request skipped",
+				message: `Could not parse GitHub pull request URL: ${pullRequestUrl}`,
+			});
 			return;
 		}
 
+		const reviewers = this.formatGitHubTeamReviewers(
+			configuredTeams,
+			pullRequest.owner,
+		);
+		const teamSlugs = this.formatGitHubTeamReviewSlugs(configuredTeams);
+		if (!teamSlugs.length) {
+			return;
+		}
+
+		const args = [
+			"api",
+			"--method",
+			"POST",
+			`repos/${pullRequest.owner}/${pullRequest.repo}/pulls/${pullRequest.number}/requested_reviewers`,
+		];
+		for (const teamSlug of teamSlugs) {
+			args.push("-f", `team_reviewers[]=${teamSlug}`);
+		}
+
 		try {
-			await this.runWorkspaceCommand(repoDir, "gh", [
-				"pr",
-				"edit",
-				pullRequestUrl,
-				"--add-reviewer",
-				reviewers.join(","),
-			]);
+			await this.runWorkspaceCommand(repoDir, "gh", args);
 			this.sessionLog(session.id).info(
 				`Requested GitHub review from team(s): ${reviewers.join(", ")}`,
 			);
@@ -1451,21 +1470,6 @@ export class AgentSessionManager extends EventEmitter {
 		return [...new Set(teams.map((team) => team.trim()).filter(Boolean))];
 	}
 
-	private getConfiguredGitHubReviewOwner(
-		session: CyrusAgentSession,
-	): string | undefined {
-		for (const repository of session.repositories) {
-			if (!repository.githubUrl) {
-				continue;
-			}
-			const owner = this.extractGitHubOwnerFromRemote(repository.githubUrl);
-			if (owner) {
-				return owner;
-			}
-		}
-		return undefined;
-	}
-
 	private formatGitHubTeamReviewers(teams: string[], owner?: string): string[] {
 		return teams
 			.map((team) => team.trim())
@@ -1478,27 +1482,31 @@ export class AgentSessionManager extends EventEmitter {
 			});
 	}
 
-	private async getGitHubRemoteOwner(
-		repoDir: string,
-	): Promise<string | undefined> {
-		const result = await this.tryWorkspaceCommand(repoDir, "git", [
-			"config",
-			"--get",
-			"remote.origin.url",
-		]);
-		const remoteUrl = result?.stdout.trim();
-		if (!remoteUrl) {
+	private formatGitHubTeamReviewSlugs(teams: string[]): string[] {
+		return [
+			...new Set(
+				teams
+					.map((team) => team.trim().split("/").pop()?.trim())
+					.filter((team): team is string => Boolean(team)),
+			),
+		];
+	}
+
+	private parseGitHubPullRequestUrl(
+		pullRequestUrl: string,
+	): { owner: string; repo: string; number: string } | undefined {
+		const match = pullRequestUrl.match(
+			/^https?:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/pull\/(\d+)(?:[?#].*)?$/,
+		);
+		if (!match) {
 			return undefined;
 		}
 
-		return this.extractGitHubOwnerFromRemote(remoteUrl);
-	}
-
-	private extractGitHubOwnerFromRemote(remoteUrl: string): string | undefined {
-		const match = remoteUrl.match(
-			/(?:github\.com[:/])([^/\s:]+)\/[^/\s]+?(?:\.git)?$/,
-		);
-		return match?.[1];
+		return {
+			owner: match[1]!,
+			repo: match[2]!,
+			number: match[3]!,
+		};
 	}
 
 	private async getPullRequestInfo(
