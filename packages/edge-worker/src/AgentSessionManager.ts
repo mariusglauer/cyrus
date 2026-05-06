@@ -79,6 +79,9 @@ type PullRequestInfo = {
 	body?: string;
 	baseRefName?: string;
 	headRefName?: string;
+	state?: string;
+	mergedAt?: string | null;
+	closedAt?: string | null;
 };
 
 type ScreenshotCandidate = {
@@ -559,13 +562,47 @@ export class AgentSessionManager extends EventEmitter {
 				return resultMessage;
 			}
 
-			const baseRef = (await this.tryWorkspaceCommand(repoDir, "git", [
-				"rev-parse",
-				"--verify",
-				baseBranch,
-			]))
-				? baseBranch
-				: `origin/${baseBranch}`;
+			await this.refreshBaseBranch(repoDir, baseBranch);
+			const baseRef = await this.resolveBaseComparisonRef(repoDir, baseBranch);
+			const changedFiles = await this.getChangedFilesForRefRange(
+				repoDir,
+				baseRef,
+				currentBranch,
+			);
+			const mergedPullRequest =
+				await this.findMergedPullRequestForBranchOrIssue(
+					repoDir,
+					currentBranch,
+					issueIdentifier,
+				);
+
+			if (!changedFiles.length) {
+				this.sessionLog(sessionId).info(
+					`Skipping PR automation for ${issueIdentifier}: no file changes relative to ${baseRef}`,
+				);
+				return this.appendDuplicatePullRequestSkipWarning(
+					resultMessage,
+					issueIdentifier,
+					baseBranch,
+					mergedPullRequest,
+				);
+			}
+
+			if (
+				mergedPullRequest?.headRefName &&
+				mergedPullRequest.headRefName === currentBranch
+			) {
+				this.sessionLog(sessionId).warn(
+					`Skipping duplicate PR automation for ${issueIdentifier}: ${currentBranch} already has merged PR ${mergedPullRequest.url}`,
+				);
+				return this.appendDuplicatePullRequestSkipWarning(
+					resultMessage,
+					issueIdentifier,
+					baseBranch,
+					mergedPullRequest,
+				);
+			}
+
 			const aheadCount = (
 				await this.runWorkspaceCommand(repoDir, "git", [
 					"rev-list",
@@ -576,11 +613,6 @@ export class AgentSessionManager extends EventEmitter {
 			if (aheadCount === "0") {
 				return resultMessage;
 			}
-			const changedFiles = await this.getChangedFilesForRefRange(
-				repoDir,
-				baseRef,
-				currentBranch,
-			);
 
 			await this.runWorkspaceCommand(repoDir, "git", [
 				"push",
@@ -673,6 +705,46 @@ export class AgentSessionManager extends EventEmitter {
 		return "main";
 	}
 
+	private async refreshBaseBranch(
+		repoDir: string,
+		baseBranch: string,
+	): Promise<void> {
+		await this.tryWorkspaceCommand(repoDir, "git", [
+			"fetch",
+			"--prune",
+			"origin",
+			`+refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`,
+		]);
+	}
+
+	private async resolveBaseComparisonRef(
+		repoDir: string,
+		baseBranch: string,
+	): Promise<string> {
+		const originBaseRef = `origin/${baseBranch}`;
+		if (
+			await this.tryWorkspaceCommand(repoDir, "git", [
+				"rev-parse",
+				"--verify",
+				originBaseRef,
+			])
+		) {
+			return originBaseRef;
+		}
+
+		if (
+			await this.tryWorkspaceCommand(repoDir, "git", [
+				"rev-parse",
+				"--verify",
+				baseBranch,
+			])
+		) {
+			return baseBranch;
+		}
+
+		return originBaseRef;
+	}
+
 	private async findExistingPullRequest(
 		repoDir: string,
 		branch: string,
@@ -698,6 +770,89 @@ export class AgentSessionManager extends EventEmitter {
 		}
 
 		return pullRequest;
+	}
+
+	private async findMergedPullRequestForBranchOrIssue(
+		repoDir: string,
+		branch: string,
+		issueIdentifier?: string,
+	): Promise<PullRequestInfo | undefined> {
+		const candidates: PullRequestInfo[] = [];
+		candidates.push(
+			...(await this.listPullRequests(repoDir, [
+				"--head",
+				branch,
+				"--state",
+				"all",
+			])),
+		);
+
+		if (issueIdentifier) {
+			candidates.push(
+				...(await this.listPullRequests(repoDir, [
+					"--search",
+					`${issueIdentifier} in:title,body`,
+					"--state",
+					"all",
+				])),
+			);
+		}
+
+		const seenUrls = new Set<string>();
+		return candidates.find((pullRequest) => {
+			if (!pullRequest.url || seenUrls.has(pullRequest.url)) {
+				return false;
+			}
+			seenUrls.add(pullRequest.url);
+			if (!this.isMergedPullRequest(pullRequest)) {
+				return false;
+			}
+			return (
+				pullRequest.headRefName === branch ||
+				this.pullRequestMentionsIssue(pullRequest, issueIdentifier)
+			);
+		});
+	}
+
+	private async listPullRequests(
+		repoDir: string,
+		args: string[],
+	): Promise<PullRequestInfo[]> {
+		const result = await this.tryWorkspaceCommand(repoDir, "gh", [
+			"pr",
+			"list",
+			...args,
+			"--json",
+			"url,isDraft,title,body,baseRefName,headRefName,state,mergedAt,closedAt",
+		]);
+		if (!result) {
+			return [];
+		}
+
+		try {
+			return JSON.parse(result.stdout || "[]") as PullRequestInfo[];
+		} catch {
+			return [];
+		}
+	}
+
+	private isMergedPullRequest(pullRequest: PullRequestInfo): boolean {
+		return (
+			pullRequest.state?.toLowerCase() === "merged" ||
+			Boolean(pullRequest.mergedAt)
+		);
+	}
+
+	private pullRequestMentionsIssue(
+		pullRequest: PullRequestInfo,
+		issueIdentifier?: string,
+	): boolean {
+		if (!issueIdentifier) {
+			return false;
+		}
+		return `${pullRequest.title ?? ""}\n${pullRequest.body ?? ""}`
+			.toLowerCase()
+			.includes(issueIdentifier.toLowerCase());
 	}
 
 	async publishFrontendScreenshotsForPullRequest(
@@ -1518,7 +1673,7 @@ export class AgentSessionManager extends EventEmitter {
 			"view",
 			pullRequestUrl,
 			"--json",
-			"url,isDraft,title,body,baseRefName,headRefName",
+			"url,isDraft,title,body,baseRefName,headRefName,state,mergedAt,closedAt",
 		]);
 		const pullRequest = JSON.parse(result.stdout || "{}") as PullRequestInfo;
 		if (!pullRequest.url) {
@@ -1561,6 +1716,21 @@ export class AgentSessionManager extends EventEmitter {
 			...resultMessage,
 			result: `${resultMessage.result.trim()}\n\nPull request: ${pullRequestUrl}`,
 		} as SDKResultMessage;
+	}
+
+	private appendDuplicatePullRequestSkipWarning(
+		resultMessage: SDKResultMessage,
+		issueIdentifier: string,
+		baseBranch: string,
+		mergedPullRequest?: PullRequestInfo,
+	): SDKResultMessage {
+		const mergedPullRequestNote = mergedPullRequest?.url
+			? ` Existing merged PR: ${mergedPullRequest.url}`
+			: "";
+		return this.appendResultWarning(
+			resultMessage,
+			`PR automation skipped: changes for ${issueIdentifier} already appear on ${baseBranch}.${mergedPullRequestNote}`,
+		);
 	}
 
 	private appendResultWarning(
