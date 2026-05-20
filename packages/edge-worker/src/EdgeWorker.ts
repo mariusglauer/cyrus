@@ -410,7 +410,7 @@ export class EdgeWorker extends EventEmitter {
 		process.env.CYRUS_GC_DELETE_REMOTE_BRANCHES?.toLowerCase().trim() ===
 		"true";
 	private readonly garbageCollectionRunWhenBusy =
-		process.env.CYRUS_GC_RUN_WHEN_BUSY?.toLowerCase().trim() === "true";
+		process.env.CYRUS_GC_RUN_WHEN_BUSY?.toLowerCase().trim() !== "false";
 	private readonly garbageCollectionMaxRemovalsPerRun = Math.max(
 		1,
 		Number.parseInt(
