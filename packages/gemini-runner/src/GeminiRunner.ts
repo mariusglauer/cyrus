@@ -4,6 +4,9 @@ import { createWriteStream, mkdirSync, type WriteStream } from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import {
+	buildSessionTempEnv,
+	cleanupSessionTempDir,
+	ensureSessionTempDir,
 	type IAgentRunner,
 	type IMessageFormatter,
 	type SDKAssistantMessage,
@@ -320,6 +323,13 @@ export class GeminiRunner extends EventEmitter implements IAgentRunner {
 
 			// Prepare environment variables for Gemini CLI
 			const geminiEnv = { ...process.env };
+			if (this.config.sessionTempDir) {
+				ensureSessionTempDir(this.config.sessionTempDir);
+				Object.assign(
+					geminiEnv,
+					buildSessionTempEnv(this.config.sessionTempDir),
+				);
+			}
 
 			if (this.config.appendSystemPrompt) {
 				try {
@@ -510,6 +520,7 @@ export class GeminiRunner extends EventEmitter implements IAgentRunner {
 				this.settingsCleanup();
 				this.settingsCleanup = null;
 			}
+			cleanupSessionTempDir(this.config.sessionTempDir);
 		}
 
 		return this.sessionInfo;

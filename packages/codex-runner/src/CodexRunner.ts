@@ -1,6 +1,11 @@
 import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
-import type { IAgentRunner, IMessageFormatter, SDKMessage } from "cyrus-core";
+import {
+	cleanupSessionTempDir,
+	type IAgentRunner,
+	type IMessageFormatter,
+	type SDKMessage,
+} from "cyrus-core";
 import { AppServerCodexBackend } from "./backend/AppServerCodexBackend.js";
 import type {
 	CodexBackend,
@@ -258,5 +263,6 @@ export class CodexRunner extends EventEmitter implements IAgentRunner {
 			void backend.close();
 		}
 		this.skillStager.cleanup();
+		cleanupSessionTempDir(this.config.sessionTempDir);
 	}
 }

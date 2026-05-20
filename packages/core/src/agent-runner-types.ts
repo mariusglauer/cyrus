@@ -487,6 +487,11 @@ export interface AgentRunnerConfig {
 	 * in one chat thread carries over to every other thread on that platform.
 	 */
 	autoMemoryDirectory?: string;
+	/**
+	 * Per-session temporary directory. Runners should export this as TMPDIR/TMP/TEMP
+	 * and clean it when the session finishes.
+	 */
+	sessionTempDir?: string;
 	/** Prompt template version information */
 	promptVersions?: {
 		userPromptVersion?: string;

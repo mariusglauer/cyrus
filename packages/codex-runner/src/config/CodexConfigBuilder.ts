@@ -1,6 +1,10 @@
 import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import {
+	buildSessionTempEnv,
+	ensureSessionTempDir,
+} from "cyrus-core";
 import type { ResolvedCodexConfig } from "../backend/types.js";
 import type {
 	CodexConfigOverrides,
@@ -104,16 +108,20 @@ export class CodexConfigBuilder {
 	private buildEnvOverride(
 		codexHome: string,
 	): Record<string, string> | undefined {
-		if (!this.config.codexHome) {
+		if (!this.config.codexHome && !this.config.sessionTempDir) {
 			return undefined;
 		}
+		ensureSessionTempDir(this.config.sessionTempDir);
 		const env: Record<string, string> = {};
 		for (const [key, value] of Object.entries(process.env)) {
 			if (typeof value === "string") {
 				env[key] = value;
 			}
 		}
-		env.CODEX_HOME = codexHome;
+		if (this.config.codexHome) {
+			env.CODEX_HOME = codexHome;
+		}
+		Object.assign(env, buildSessionTempEnv(this.config.sessionTempDir));
 		return env;
 	}
 
@@ -200,13 +208,20 @@ export class CodexConfigBuilder {
 	private async hasCodexSubscription(): Promise<boolean> {
 		const codexBin = this.config.codexPath || "codex";
 		try {
+			ensureSessionTempDir(this.config.sessionTempDir);
 			const { execFile } = await import("node:child_process");
 			const { promisify } = await import("node:util");
 			const execFileAsync = promisify(execFile);
 			const { stdout, stderr } = await execFileAsync(
 				codexBin,
 				["login", "status"],
-				{ timeout: 5_000 },
+				{
+					timeout: 5_000,
+					env: {
+						...(process.env as Record<string, string>),
+						...buildSessionTempEnv(this.config.sessionTempDir),
+					},
+				},
 			);
 			const result = /logged in using chatgpt/i.test(stdout + stderr);
 			console.log(

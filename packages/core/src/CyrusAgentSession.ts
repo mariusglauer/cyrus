@@ -107,6 +107,7 @@ export interface CyrusAgentSession {
 		totalCostUsd?: number;
 		usage?: any;
 		commentId?: string;
+		sessionTempDir?: string;
 	};
 }
 

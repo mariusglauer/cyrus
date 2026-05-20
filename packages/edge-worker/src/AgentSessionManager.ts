@@ -53,10 +53,18 @@ const SKIPPED_SCREENSHOT_DIRS = new Set([
 	".git",
 	".next",
 	".turbo",
+	"assets",
 	"build",
 	"dist",
+	"icons",
+	"images",
+	"img",
+	"logos",
 	"node_modules",
 	"out",
+	"public",
+	"static",
+	"uploads",
 ]);
 
 /**
@@ -1237,6 +1245,9 @@ export class AgentSessionManager extends EventEmitter {
 		if (!SCREENSHOT_EXTENSIONS.has(extension)) {
 			return undefined;
 		}
+		if (!this.looksLikeGeneratedScreenshotPath(filePath)) {
+			return undefined;
+		}
 
 		const fileStat = await stat(filePath).catch(() => undefined);
 		if (
@@ -1261,9 +1272,33 @@ export class AgentSessionManager extends EventEmitter {
 	}
 
 	private looksLikeGeneratedScreenshotPath(filePath: string): boolean {
-		const lower = filePath.toLowerCase();
-		return /screenshot|screen-shot|playwright|cypress|test-results|visual|browser|chrome-devtools|puppeteer|snapshot/.test(
-			lower,
+		const lower = filePath.replace(/\\/g, "/").toLowerCase();
+		if (this.isRejectedScreenshotAssetPath(lower)) {
+			return false;
+		}
+
+		return (
+			/(^|\/)(cyrus-screenshots|screenshots?|screen-shots|playwright-report|test-results|cypress\/screenshots)(\/|$)/.test(
+				lower,
+			) ||
+			/(^|\/)(playwright|chrome-devtools|puppeteer)(\/|$)/.test(lower) ||
+			/(^|[-_.])(screenshot|screen-shot|chrome_screenshot|browser-screenshot|full-page|viewport)([-_.]|$)/.test(
+				basename(lower),
+			)
+		);
+	}
+
+	private isRejectedScreenshotAssetPath(normalizedLowerPath: string): boolean {
+		if (
+			/(^|\/)(cyrus-screenshots|screenshots?|screen-shots|playwright-report|test-results)(\/|$)/.test(
+				normalizedLowerPath,
+			)
+		) {
+			return false;
+		}
+
+		return /(^|\/)(assets?|images?|img|icons?|logos?|public|static|uploads|fixtures?|mocks?|storybook-static)(\/|$)/.test(
+			normalizedLowerPath,
 		);
 	}
 
@@ -1422,6 +1457,9 @@ export class AgentSessionManager extends EventEmitter {
 	private rememberScreenshotPath(sessionId: string, filePath: string): void {
 		const trimmedPath = filePath.trim();
 		if (!trimmedPath) {
+			return;
+		}
+		if (!this.looksLikeGeneratedScreenshotPath(trimmedPath)) {
 			return;
 		}
 		const existing = this.screenshotPathsBySession.get(sessionId) ?? new Set();

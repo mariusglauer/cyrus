@@ -23,7 +23,10 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import type { AgentPendingWork, AskUserQuestionInput } from "cyrus-core";
 import {
+	buildSessionTempEnv,
+	cleanupSessionTempDir,
 	createLogger,
+	ensureSessionTempDir,
 	type IAgentRunner,
 	type ILogger,
 	LogLevel,
@@ -647,6 +650,9 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 			logSandboxRequirementFailures(sandboxRequirements, this.logger);
 
 			const isDebugLogging = this.logger.getLevel() === LogLevel.DEBUG;
+			if (this.config.sessionTempDir) {
+				ensureSessionTempDir(this.config.sessionTempDir);
+			}
 
 			const queryOptions: Parameters<typeof query>[0] = {
 				prompt: promptForQuery,
@@ -669,6 +675,7 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 					settingSources: ["user", "project", "local"],
 					env: {
 						...buildBaseSessionEnv(),
+						...buildSessionTempEnv(this.config.sessionTempDir),
 						// CLAUDE_CODE_SUBPROCESS_ENV_SCRUB is intentionally NOT set while
 						// the Linux bubblewrap sandbox side effects it triggers are being
 						// investigated. The sandbox requirements precheck is still run
@@ -927,6 +934,7 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 				this.readableLogStream.end();
 				this.readableLogStream = null;
 			}
+			cleanupSessionTempDir(this.config.sessionTempDir);
 		}
 
 		return this.sessionInfo;

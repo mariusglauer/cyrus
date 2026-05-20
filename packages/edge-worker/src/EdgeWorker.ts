@@ -2,7 +2,16 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { execFileSync, execSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
+import {
+	mkdir,
+	readdir,
+	readFile,
+	rename,
+	rm,
+	stat,
+	statfs,
+	writeFile,
+} from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { LinearClient } from "@linear/sdk";
 import type {
@@ -57,6 +66,8 @@ import {
 	createLogger,
 	DEFAULT_PROXY_URL,
 	getDefaultWorktreesDir,
+	getSessionTempDir,
+	getSessionTempRoot,
 	isAgentSessionCreatedWebhook,
 	isAgentSessionPromptedWebhook,
 	isContentUpdateMessage,
@@ -70,6 +81,7 @@ import {
 	isIssueTitleOrDescriptionUpdateWebhook,
 	isIssueUnassignedWebhook,
 	isSessionStartMessage,
+	isSessionTempDirName,
 	isStopSignalMessage,
 	isUnassignMessage,
 	isUserPromptMessage,
@@ -252,6 +264,8 @@ type GarbageCollectionSummary = {
 	scannedBranches: number;
 	removedLocalBranches: number;
 	removedRemoteBranches: number;
+	scannedTempDirs: number;
+	removedTempDirs: number;
 	removedSessions: number;
 	removedRegistrySessions: number;
 	skippedProtected: number;
@@ -264,6 +278,7 @@ type GarbageCollectionSummary = {
 type GarbageCollectionProtection = {
 	issueIdentifiers: Set<string>;
 	branchNames: Set<string>;
+	tempDirNames: Set<string>;
 };
 
 type WorktreeBranchRef = {
@@ -394,6 +409,25 @@ export class EdgeWorker extends EventEmitter {
 	private readonly garbageCollectionMaxRemovalsPerRun = Math.max(
 		1,
 		Number.parseInt(process.env.CYRUS_GC_MAX_REMOVALS_PER_RUN || "5", 10) || 5,
+	);
+	private readonly garbageCollectionTempTtlMs = Math.max(
+		60_000,
+		Number.parseInt(process.env.CYRUS_GC_TEMP_TTL_MS || "3600000", 10) ||
+			3_600_000,
+	);
+	private readonly diskGuardEnabled =
+		process.env.CYRUS_DISK_GUARD_ENABLED?.toLowerCase().trim() !== "false";
+	private readonly diskGuardMinFreeBytes = Math.max(
+		0,
+		Number.parseInt(
+			process.env.CYRUS_DISK_GUARD_MIN_FREE_BYTES || "10737418240",
+			10,
+		) || 10_737_418_240,
+	);
+	private readonly diskGuardMinFreePercent = Math.max(
+		0,
+		Number.parseFloat(process.env.CYRUS_DISK_GUARD_MIN_FREE_PERCENT || "5") ||
+			5,
 	);
 	private readonly operationalMonitorIntervalMs = Math.max(
 		30_000,
@@ -3942,7 +3976,13 @@ ${taskSection}`;
 				deleteRemoteBranches: this.garbageCollectionDeleteRemoteBranches,
 				runWhenBusy: this.garbageCollectionRunWhenBusy,
 				maxRemovalsPerRun: this.garbageCollectionMaxRemovalsPerRun,
+				tempTtlMs: this.garbageCollectionTempTtlMs,
 				lastRun: this.lastGarbageCollectionSummary,
+			},
+			diskGuard: {
+				enabled: this.diskGuardEnabled,
+				minFreeBytes: this.diskGuardMinFreeBytes,
+				minFreePercent: this.diskGuardMinFreePercent,
 			},
 		};
 	}
@@ -4305,7 +4345,10 @@ ${taskSection}`;
 		this.garbageCollectionTimer.unref?.();
 	}
 
-	private async runGarbageCollection(reason: string): Promise<void> {
+	private async runGarbageCollection(
+		reason: string,
+		options: { ignoreBusy?: boolean } = {},
+	): Promise<void> {
 		if (!this.garbageCollectionEnabled || this.garbageCollectionRunning) {
 			return;
 		}
@@ -4319,6 +4362,8 @@ ${taskSection}`;
 			scannedBranches: 0,
 			removedLocalBranches: 0,
 			removedRemoteBranches: 0,
+			scannedTempDirs: 0,
+			removedTempDirs: 0,
 			removedSessions: 0,
 			removedRegistrySessions: 0,
 			skippedProtected: 0,
@@ -4330,6 +4375,7 @@ ${taskSection}`;
 		try {
 			if (
 				!this.garbageCollectionRunWhenBusy &&
+				!options.ignoreBusy &&
 				this.computeStatus() !== "idle"
 			) {
 				summary.skippedBecauseBusy = true;
@@ -4344,6 +4390,7 @@ ${taskSection}`;
 			);
 
 			const protection = this.buildGarbageCollectionProtection();
+			await this.collectGarbageFromTempDirs(protection, summary);
 			await this.collectGarbageFromWorktrees(protection, summary);
 			await this.collectGarbageFromLocalBranches(protection, summary);
 
@@ -4364,12 +4411,13 @@ ${taskSection}`;
 			summary.removedWorktrees > 0 ||
 			summary.removedLocalBranches > 0 ||
 			summary.removedRemoteBranches > 0 ||
+			summary.removedTempDirs > 0 ||
 			summary.removedSessions > 0 ||
 			summary.removedRegistrySessions > 0 ||
 			summary.errors.length > 0
 		) {
 			this.logger.info(
-				`Garbage collection finished: removed ${summary.removedWorktrees} worktree(s), ${summary.removedLocalBranches} local branch(es), ${summary.removedRemoteBranches} remote branch(es), ${summary.removedSessions} persisted session(s)`,
+				`Garbage collection finished: removed ${summary.removedWorktrees} worktree(s), ${summary.removedLocalBranches} local branch(es), ${summary.removedRemoteBranches} remote branch(es), ${summary.removedTempDirs} temp dir(s), ${summary.removedSessions} persisted session(s)`,
 			);
 		}
 	}
@@ -4377,6 +4425,7 @@ ${taskSection}`;
 	private buildGarbageCollectionProtection(): GarbageCollectionProtection {
 		const issueIdentifiers = new Set<string>();
 		const branchNames = new Set<string>();
+		const tempDirNames = new Set<string>();
 		const addIssueIdentifier = (identifier?: string | null) => {
 			if (identifier?.trim()) {
 				issueIdentifiers.add(identifier.trim().toLowerCase());
@@ -4387,7 +4436,15 @@ ${taskSection}`;
 				branchNames.add(branchName.trim().toLowerCase());
 			}
 		};
+		const addSessionId = (sessionId?: string | null) => {
+			if (sessionId?.trim()) {
+				tempDirNames.add(
+					basename(getSessionTempDir(this.cyrusHome, sessionId)),
+				);
+			}
+		};
 		const addQueueItem = (item: AgentSessionQueueItem) => {
+			addSessionId(item.sessionId);
 			if (item.origin === "linear") {
 				addIssueIdentifier(item.workItemIdentifier);
 				addIssueIdentifier(item.webhook?.agentSession?.issue?.identifier);
@@ -4405,6 +4462,7 @@ ${taskSection}`;
 			addQueueItem(item);
 		}
 		for (const session of this.agentSessionManager.getActiveSessions()) {
+			addSessionId(session.id);
 			addIssueIdentifier(session.issueContext?.issueIdentifier);
 			addIssueIdentifier(session.issue?.identifier);
 			for (const repoContext of session.repositories) {
@@ -4415,7 +4473,49 @@ ${taskSection}`;
 			addIssueIdentifier(parked.agentSession.issue?.identifier);
 		}
 
-		return { issueIdentifiers, branchNames };
+		return { issueIdentifiers, branchNames, tempDirNames };
+	}
+
+	private async collectGarbageFromTempDirs(
+		protection: GarbageCollectionProtection,
+		summary: GarbageCollectionSummary,
+	): Promise<void> {
+		const tempRoot = getSessionTempRoot(this.cyrusHome);
+		if (!existsSync(tempRoot)) {
+			return;
+		}
+
+		const cutoff = Date.now() - this.garbageCollectionTempTtlMs;
+		const entries = await readdir(tempRoot, { withFileTypes: true }).catch(
+			() => [],
+		);
+		for (const entry of entries) {
+			if (!entry.isDirectory() || !isSessionTempDirName(entry.name)) {
+				continue;
+			}
+
+			summary.scannedTempDirs++;
+			if (protection.tempDirNames.has(entry.name)) {
+				summary.skippedProtected++;
+				continue;
+			}
+
+			const tempPath = join(tempRoot, entry.name);
+			const info = await stat(tempPath).catch(() => undefined);
+			if (!info || info.mtimeMs >= cutoff) {
+				continue;
+			}
+
+			try {
+				await rm(tempPath, { recursive: true, force: true });
+				summary.removedTempDirs++;
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				summary.errors.push(
+					`Failed to remove temp directory ${entry.name}: ${message}`,
+				);
+			}
+		}
 	}
 
 	private async collectGarbageFromWorktrees(
@@ -6851,6 +6951,7 @@ ${taskSection}`;
 				);
 				return;
 			}
+			await this.ensureDiskSpaceForAgentTask(item);
 			await this.runAgentSessionQueueItemWithWatchdog(item);
 		} catch (error) {
 			const isRateLimited = this.applyLinearRateLimitCooldown(error);
@@ -6899,6 +7000,83 @@ ${taskSection}`;
 				clearTimeout(timeout);
 			}
 		}
+	}
+
+	private async ensureDiskSpaceForAgentTask(
+		item: AgentSessionQueueItem,
+	): Promise<void> {
+		if (!this.diskGuardEnabled) {
+			return;
+		}
+
+		const before = await this.getDiskAvailability(this.cyrusHome);
+		if (this.hasRequiredDiskSpace(before)) {
+			return;
+		}
+
+		this.logger.warn(
+			`Low disk space before ${item.workItemIdentifier}: ${this.formatBytes(
+				before.availableBytes,
+			)} free (${before.availablePercent.toFixed(1)}%)`,
+		);
+
+		await this.runGarbageCollection("low-disk", { ignoreBusy: true });
+
+		const after = await this.getDiskAvailability(this.cyrusHome);
+		if (this.hasRequiredDiskSpace(after)) {
+			this.logger.info(
+				`Disk guard recovered space for ${item.workItemIdentifier}: ${this.formatBytes(
+					after.availableBytes,
+				)} free (${after.availablePercent.toFixed(1)}%)`,
+			);
+			return;
+		}
+
+		throw new Error(
+			`Insufficient disk space for ${item.workItemIdentifier}: ${this.formatBytes(
+				after.availableBytes,
+			)} free (${after.availablePercent.toFixed(1)}%). Required at least ${this.formatBytes(
+				this.diskGuardMinFreeBytes,
+			)} and ${this.diskGuardMinFreePercent}% free.`,
+		);
+	}
+
+	private async getDiskAvailability(path: string): Promise<{
+		availableBytes: number;
+		totalBytes: number;
+		availablePercent: number;
+	}> {
+		const info = await statfs(path);
+		const availableBytes = Number(info.bavail) * Number(info.bsize);
+		const totalBytes = Number(info.blocks) * Number(info.bsize);
+		const availablePercent =
+			totalBytes > 0 ? (availableBytes / totalBytes) * 100 : 0;
+		return { availableBytes, totalBytes, availablePercent };
+	}
+
+	private hasRequiredDiskSpace(space: {
+		availableBytes: number;
+		availablePercent: number;
+	}): boolean {
+		return (
+			space.availableBytes >= this.diskGuardMinFreeBytes &&
+			space.availablePercent >= this.diskGuardMinFreePercent
+		);
+	}
+
+	private formatBytes(bytes: number): string {
+		if (!Number.isFinite(bytes) || bytes <= 0) {
+			return "0 B";
+		}
+
+		const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+		let value = bytes;
+		let unitIndex = 0;
+		while (value >= 1024 && unitIndex < units.length - 1) {
+			value /= 1024;
+			unitIndex++;
+		}
+		return `${value.toFixed(unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
 	}
 
 	private async runQueuedLinearSession(
@@ -9759,6 +9937,14 @@ ${input.userComment}
 				plugins,
 				resolvedSkillContext,
 			);
+		const sessionTempDir = getSessionTempDir(this.cyrusHome, sessionId);
+		session.metadata = {
+			...session.metadata,
+			sessionTempDir,
+		};
+		const runnerAllowedDirectories = [
+			...new Set([...allowedDirectories, sessionTempDir]),
+		];
 
 		const result = this.runnerConfigBuilder.buildIssueConfig({
 			session,
@@ -9766,7 +9952,7 @@ ${input.userComment}
 			sessionId,
 			systemPrompt,
 			allowedTools,
-			allowedDirectories,
+			allowedDirectories: runnerAllowedDirectories,
 			disallowedTools,
 			resumeSessionId,
 			labels,
@@ -9784,6 +9970,7 @@ ${input.userComment}
 					? this.config.linearMcpConfigs
 					: this.config.githubMcpConfigs,
 			linearWorkspaceId,
+			sessionTempDir,
 			cyrusHome: this.cyrusHome,
 			logger: log,
 			plugins,

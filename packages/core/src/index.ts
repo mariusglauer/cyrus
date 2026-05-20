@@ -266,6 +266,15 @@ export {
 	LINEAR_WEBHOOK_IPS,
 	WebhookIpValidator,
 } from "./security/index.js";
+export {
+	buildSessionTempEnv,
+	cleanupSessionTempDir,
+	ensureSessionTempDir,
+	getSessionTempDir,
+	getSessionTempRoot,
+	isSessionTempDirName,
+	sanitizeSessionTempSegment,
+} from "./session-temp.js";
 // Simple Agent Runner types
 export type {
 	IAgentProgressEvent,

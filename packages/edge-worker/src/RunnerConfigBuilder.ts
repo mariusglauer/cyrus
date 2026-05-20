@@ -73,6 +73,7 @@ export interface ChatRunnerConfigInput {
 	systemPrompt: string;
 	sessionId: string;
 	resumeSessionId?: string;
+	sessionTempDir?: string;
 	cyrusHome: string;
 	/** Chat platform name (e.g. "slack") — used to namespace the shared auto-memory dir */
 	platformName: string;
@@ -134,6 +135,7 @@ export interface IssueRunnerConfigInput {
 	 */
 	platformMcpConfigOverrides?: readonly string[];
 	linearWorkspaceId?: string;
+	sessionTempDir?: string;
 	cyrusHome: string;
 	logger: ILogger;
 	onMessage: (message: SDKMessage) => void | Promise<void>;
@@ -272,11 +274,13 @@ export class RunnerConfigBuilder {
 			allowedDirectories: [
 				input.workspacePath,
 				autoMemoryDirectory,
+				...(input.sessionTempDir ? [input.sessionTempDir] : []),
 				...repositoryPaths,
 			],
 			workspaceName: input.workspaceName,
 			cyrusHome: input.cyrusHome,
 			autoMemoryDirectory,
+			sessionTempDir: input.sessionTempDir,
 			appendSystemPrompt: appendCloudRuntimeAddendum(
 				appendBrowserUseAddendum(appendFailureModeAddendum(input.systemPrompt)),
 			),
@@ -410,6 +414,7 @@ export class RunnerConfigBuilder {
 			...(additionalDirectories.length > 0 && { additionalDirectories }),
 			workspaceName: input.session.issue?.identifier || input.session.issueId,
 			cyrusHome: input.cyrusHome,
+			sessionTempDir: input.sessionTempDir,
 			mcpConfigPath,
 			mcpConfig,
 			appendSystemPrompt: appendCloudRuntimeAddendum(
@@ -552,8 +557,11 @@ export class RunnerConfigBuilder {
 					// metadata dirs — all of which need OS-level read access alongside the worktree.
 					allowRead: [".", ...input.allowedDirectories],
 					denyRead: ["~/"],
-					// Restrict subprocess writes to the session worktree only
-					allowWrite: [input.session.workspace.path],
+					// Restrict subprocess writes to the session worktree and its temp dir
+					allowWrite: [
+						input.session.workspace.path,
+						...(input.sessionTempDir ? [input.sessionTempDir] : []),
+					],
 				},
 			};
 		}

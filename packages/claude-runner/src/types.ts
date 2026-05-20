@@ -102,6 +102,8 @@ export interface ClaudeRunnerConfig {
 	 * back to its default (~/.claude/projects/<sanitized-cwd>/memory/).
 	 */
 	autoMemoryDirectory?: string;
+	/** Per-session temp directory exported as TMPDIR/TMP/TEMP and cleaned on finish. */
+	sessionTempDir?: string;
 }
 
 export interface ClaudeSessionInfo {

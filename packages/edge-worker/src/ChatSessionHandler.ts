@@ -9,7 +9,7 @@ import type {
 	ILogger,
 	RepositoryConfig,
 } from "cyrus-core";
-import { createLogger } from "cyrus-core";
+import { createLogger, getSessionTempDir } from "cyrus-core";
 import { AgentSessionManager } from "./AgentSessionManager.js";
 import type { ChatRepositoryProvider } from "./ChatRepositoryProvider.js";
 import type { RunnerConfigBuilder } from "./RunnerConfigBuilder.js";
@@ -646,6 +646,7 @@ export class ChatSessionHandler<TEvent> {
 		const skillsConfig = this.deps.resolveSkillsConfig
 			? await this.deps.resolveSkillsConfig({ repository, repositoryPaths })
 			: {};
+		const sessionTempDir = getSessionTempDir(this.deps.cyrusHome, sessionId);
 
 		return this.deps.runnerConfigBuilder.buildChatConfig({
 			workspacePath,
@@ -653,6 +654,7 @@ export class ChatSessionHandler<TEvent> {
 			systemPrompt,
 			sessionId,
 			resumeSessionId,
+			sessionTempDir,
 			cyrusHome: this.deps.cyrusHome,
 			platformName: this.adapter.platformName,
 			linearWorkspaceId: provider.getDefaultLinearWorkspaceId(),
