@@ -301,6 +301,9 @@ type LinearSessionLink = {
 	issueIdentifier: string;
 };
 
+const DEFAULT_GC_INTERVAL_MS = 3_600_000;
+const DEFAULT_GC_MAX_REMOVALS_PER_RUN = 50;
+
 /**
  * Unified edge worker that **orchestrates**
  *   capturing Linear webhooks,
@@ -386,8 +389,10 @@ export class EdgeWorker extends EventEmitter {
 		process.env.CYRUS_GC_ENABLED?.toLowerCase().trim() !== "false";
 	private readonly garbageCollectionIntervalMs = Math.max(
 		300_000,
-		Number.parseInt(process.env.CYRUS_GC_INTERVAL_MS || "21600000", 10) ||
-			21_600_000,
+		Number.parseInt(
+			process.env.CYRUS_GC_INTERVAL_MS || String(DEFAULT_GC_INTERVAL_MS),
+			10,
+		) || DEFAULT_GC_INTERVAL_MS,
 	);
 	private readonly garbageCollectionSessionTtlMs = Math.max(
 		3_600_000,
@@ -408,7 +413,11 @@ export class EdgeWorker extends EventEmitter {
 		process.env.CYRUS_GC_RUN_WHEN_BUSY?.toLowerCase().trim() === "true";
 	private readonly garbageCollectionMaxRemovalsPerRun = Math.max(
 		1,
-		Number.parseInt(process.env.CYRUS_GC_MAX_REMOVALS_PER_RUN || "5", 10) || 5,
+		Number.parseInt(
+			process.env.CYRUS_GC_MAX_REMOVALS_PER_RUN ||
+				String(DEFAULT_GC_MAX_REMOVALS_PER_RUN),
+			10,
+		) || DEFAULT_GC_MAX_REMOVALS_PER_RUN,
 	);
 	private readonly garbageCollectionTempTtlMs = Math.max(
 		60_000,
