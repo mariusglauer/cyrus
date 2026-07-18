@@ -16,37 +16,43 @@ vi.mock("cyrus-gemini-runner");
 vi.mock("cyrus-linear-event-transport");
 vi.mock("@linear/sdk");
 vi.mock("../src/SharedApplicationServer.js", () => ({
-	SharedApplicationServer: vi.fn().mockImplementation(() => ({
-		initializeFastify: vi.fn(),
-		getFastifyInstance: vi.fn().mockReturnValue({
-			get: vi.fn(),
-			post: vi.fn(),
-		}),
-		start: vi.fn().mockResolvedValue(undefined),
-		stop: vi.fn().mockResolvedValue(undefined),
-		getWebhookUrl: vi.fn().mockReturnValue("http://localhost:3456/webhook"),
-	})),
+	SharedApplicationServer: vi.fn().mockImplementation(function () {
+		return {
+			initializeFastify: vi.fn(),
+			getFastifyInstance: vi.fn().mockReturnValue({
+				get: vi.fn(),
+				post: vi.fn(),
+			}),
+			start: vi.fn().mockResolvedValue(undefined),
+			stop: vi.fn().mockResolvedValue(undefined),
+			getWebhookUrl: vi.fn().mockReturnValue("http://localhost:3456/webhook"),
+		};
+	}),
 }));
 vi.mock("../src/AgentSessionManager.js", () => ({
-	AgentSessionManager: vi.fn().mockImplementation(() => ({
-		getAllAgentRunners: vi.fn().mockReturnValue([]),
-		getAllSessions: vi.fn().mockReturnValue([]),
-		getActiveSessionsByIssueId: vi.fn().mockReturnValue([]),
-		createCyrusAgentSession: vi.fn(),
-		getSession: vi.fn(),
-		setActivitySink: vi.fn(),
-		on: vi.fn(),
-		emit: vi.fn(),
-	})),
+	AgentSessionManager: vi.fn().mockImplementation(function () {
+		return {
+			getAllAgentRunners: vi.fn().mockReturnValue([]),
+			getAllSessions: vi.fn().mockReturnValue([]),
+			getActiveSessionsByIssueId: vi.fn().mockReturnValue([]),
+			createCyrusAgentSession: vi.fn(),
+			getSession: vi.fn(),
+			setActivitySink: vi.fn(),
+			on: vi.fn(),
+			emit: vi.fn(),
+		};
+	}),
 }));
 vi.mock("cyrus-core", async (importOriginal) => {
 	const actual = (await importOriginal()) as any;
 	return {
 		...actual,
-		PersistenceManager: vi.fn().mockImplementation(() => ({
-			loadEdgeWorkerState: vi.fn().mockResolvedValue(null),
-			saveEdgeWorkerState: vi.fn().mockResolvedValue(undefined),
-		})),
+		PersistenceManager: vi.fn().mockImplementation(function () {
+			return {
+				loadEdgeWorkerState: vi.fn().mockResolvedValue(null),
+				saveEdgeWorkerState: vi.fn().mockResolvedValue(undefined),
+			};
+		}),
 	};
 });
 vi.mock("file-type");
