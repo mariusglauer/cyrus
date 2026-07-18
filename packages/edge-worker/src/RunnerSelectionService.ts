@@ -64,7 +64,7 @@ export class RunnerSelectionService {
 		if (runnerType === "cursor") {
 			return this.config.cursorDefaultModel || "composer-2";
 		}
-		return this.config.codexDefaultModel || "gpt-5.5";
+		return this.config.codexDefaultModel || "gpt-5.6-sol";
 	}
 
 	/**
@@ -83,7 +83,7 @@ export class RunnerSelectionService {
 			return "gemini-2.5-flash";
 		}
 		if (runnerType === "codex") {
-			return "gpt-5.2-codex";
+			return "gpt-5.6-terra";
 		}
 		if (runnerType === "cursor") {
 			return this.config.cursorDefaultFallbackModel || "composer-2";
@@ -210,7 +210,7 @@ export class RunnerSelectionService {
 				return "gemini-2.5-flash";
 			}
 			if (isCodexModel(normalizedModel)) {
-				return "gpt-5.2-codex";
+				return "gpt-5.6-terra";
 			}
 			return "gpt-5";
 		};

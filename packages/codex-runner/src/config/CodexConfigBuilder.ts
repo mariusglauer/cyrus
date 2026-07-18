@@ -17,6 +17,9 @@ import { resolveCodexSandbox } from "./sandboxPolicy.js";
 function getDefaultReasoningEffortForModel(
 	model?: string,
 ): CodexRunnerConfig["modelReasoningEffort"] | undefined {
+	if (/^gpt-5\.6(?:-|$)/i.test(model || "")) {
+		return "medium";
+	}
 	// All gpt-5 variants (including plain "gpt-5") reject xhigh; pin to "high".
 	return /^gpt-5/i.test(model || "") ? "high" : undefined;
 }

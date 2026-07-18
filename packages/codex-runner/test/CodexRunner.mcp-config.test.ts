@@ -2,9 +2,20 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { CodexConfigBuilder } from "../src/config/CodexConfigBuilder.js";
 import { buildCodexMcpServersConfig } from "../src/config/mcpConfigTranslator.js";
 
 describe("CodexRunner MCP config mapping", () => {
+	it("uses GPT-5.6 Sol with medium reasoning by default", async () => {
+		const config = await new CodexConfigBuilder({
+			workingDirectory: process.cwd(),
+			model: "gpt-5.6-sol",
+		}).build();
+
+		expect(config.model).toBe("gpt-5.6-sol");
+		expect(config.modelReasoningEffort).toBe("medium");
+	});
+
 	it("maps generic headers to Codex http_headers for HTTP MCP servers", () => {
 		const mcpServers = buildCodexMcpServersConfig({
 			workingDirectory: process.cwd(),

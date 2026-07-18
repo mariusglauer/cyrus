@@ -878,6 +878,7 @@ Issue: {{issue_identifier}}`;
 			// Assert
 			expect(capturedRunnerType).toBe("codex");
 			expect(CodexRunner).toHaveBeenCalled();
+			expect(capturedRunnerConfig.model).toBe("gpt-5.6-sol");
 			expect(ClaudeRunner).not.toHaveBeenCalled();
 		});
 
