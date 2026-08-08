@@ -6,11 +6,10 @@ import { ConfigManager } from "../src/ConfigManager.js";
 vi.mock("node:fs/promises");
 
 /**
- * Tests for CYPACK-1273: ensure the `prReviewTrigger` flag participates in
- * the config hot-reload pipeline — both the merge in `loadConfigSafely()` and
- * the global-change detection in `detectGlobalConfigChanges()`. Without these,
- * a `prReviewTrigger` change written to config.json while Cyrus is running
- * would be silently dropped (see CLAUDE.md note #9).
+ * Tests for trigger flags that must participate in the config hot-reload
+ * pipeline — both the merge in `loadConfigSafely()` and the global-change
+ * detection in `detectGlobalConfigChanges()`. Without these, flag changes
+ * written to config.json while Cyrus is running would be silently dropped.
  */
 describe("ConfigManager - prReviewTrigger hot-reload (CYPACK-1273)", () => {
 	let logger: ILogger;
@@ -54,6 +53,8 @@ describe("ConfigManager - prReviewTrigger hot-reload (CYPACK-1273)", () => {
 			JSON.stringify({
 				repositories: baseConfig.repositories,
 				prReviewTrigger: false,
+				githubConflictRebaseTrigger: true,
+				githubConflictRebaseIncludeExternalAuthors: true,
 			}) as any,
 		);
 
@@ -61,6 +62,8 @@ describe("ConfigManager - prReviewTrigger hot-reload (CYPACK-1273)", () => {
 
 		expect(newConfig).not.toBeNull();
 		expect(newConfig.prReviewTrigger).toBe(false);
+		expect(newConfig.githubConflictRebaseTrigger).toBe(true);
+		expect(newConfig.githubConflictRebaseIncludeExternalAuthors).toBe(true);
 	});
 
 	it("detects a prReviewTrigger change as a global config change", () => {
@@ -74,8 +77,24 @@ describe("ConfigManager - prReviewTrigger hot-reload (CYPACK-1273)", () => {
 		expect(changed).toBe(true);
 	});
 
+	it("detects a GitHub conflict rebase trigger change as a global config change", () => {
+		const manager = makeManager(baseConfig);
+
+		const changed = (manager as any).detectGlobalConfigChanges({
+			...baseConfig,
+			githubConflictRebaseTrigger: true,
+		});
+
+		expect(changed).toBe(true);
+	});
+
 	it("preserves an existing prReviewTrigger value when the file omits it", async () => {
-		const manager = makeManager({ ...baseConfig, prReviewTrigger: false });
+		const manager = makeManager({
+			...baseConfig,
+			prReviewTrigger: false,
+			githubConflictRebaseTrigger: true,
+			githubConflictRebaseIncludeExternalAuthors: true,
+		});
 		vi.mocked(readFile).mockResolvedValue(
 			JSON.stringify({ repositories: baseConfig.repositories }) as any,
 		);
@@ -83,5 +102,7 @@ describe("ConfigManager - prReviewTrigger hot-reload (CYPACK-1273)", () => {
 		const newConfig = await (manager as any).loadConfigSafely();
 
 		expect(newConfig.prReviewTrigger).toBe(false);
+		expect(newConfig.githubConflictRebaseTrigger).toBe(true);
+		expect(newConfig.githubConflictRebaseIncludeExternalAuthors).toBe(true);
 	});
 });

@@ -237,6 +237,9 @@ export class WorkerService {
 					| undefined) || edgeConfig.defaultRunner,
 			issueUpdateTrigger: edgeConfig.issueUpdateTrigger,
 			prReviewTrigger: edgeConfig.prReviewTrigger,
+			githubConflictRebaseTrigger: edgeConfig.githubConflictRebaseTrigger,
+			githubConflictRebaseIncludeExternalAuthors:
+				edgeConfig.githubConflictRebaseIncludeExternalAuthors,
 			promptDefaults: edgeConfig.promptDefaults,
 			linearWorkspaces: edgeConfig.linearWorkspaces,
 			webhookBaseUrl: process.env.CYRUS_BASE_URL,

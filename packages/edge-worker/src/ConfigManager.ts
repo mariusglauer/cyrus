@@ -258,6 +258,14 @@ export class ConfigManager extends EventEmitter {
 				// otherwise keep current or default to true
 				prReviewTrigger:
 					parsedConfig.prReviewTrigger ?? this.config.prReviewTrigger,
+				// GitHub conflict rebase trigger: use parsed values if explicitly set,
+				// otherwise keep current values.
+				githubConflictRebaseTrigger:
+					parsedConfig.githubConflictRebaseTrigger ??
+					this.config.githubConflictRebaseTrigger,
+				githubConflictRebaseIncludeExternalAuthors:
+					parsedConfig.githubConflictRebaseIncludeExternalAuthors ??
+					this.config.githubConflictRebaseIncludeExternalAuthors,
 				// Sandbox / egress proxy config
 				sandbox: parsedConfig.sandbox ?? this.config.sandbox,
 			};
@@ -357,6 +365,8 @@ export class ConfigManager extends EventEmitter {
 			"issueUpdateTrigger",
 			"slackThreadFollowing",
 			"prReviewTrigger",
+			"githubConflictRebaseTrigger",
+			"githubConflictRebaseIncludeExternalAuthors",
 			"linearWorkspaces",
 			"userAccessControl",
 			"sandbox",
