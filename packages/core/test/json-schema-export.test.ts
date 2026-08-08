@@ -57,6 +57,8 @@ describe("JSON Schema export", () => {
 				"githubMcpConfigs",
 				"issueUpdateTrigger",
 				"prReviewTrigger",
+				"githubConflictRebaseTrigger",
+				"githubConflictRebaseIncludeExternalAuthors",
 				"userAccessControl",
 				"promptDefaults",
 				"sandbox",

@@ -477,6 +477,19 @@ export const EdgeConfigSchema = z.object({
 	prReviewTrigger: z.boolean().optional(),
 
 	/**
+	 * Whether Cyrus should automatically enqueue a rebase task when GitHub reports
+	 * an open PR as unmergeable because of merge conflicts. Defaults to false.
+	 */
+	githubConflictRebaseTrigger: z.boolean().optional(),
+
+	/**
+	 * Whether automatic conflict rebasing may also handle PRs not opened by Cyrus.
+	 * Defaults to false; Cyrus-owned PRs are detected by configured author logins,
+	 * bot username, branch prefix, or PR marker/signature.
+	 */
+	githubConflictRebaseIncludeExternalAuthors: z.boolean().optional(),
+
+	/**
 	 * Global user access control settings.
 	 * Applied to all repositories unless overridden.
 	 */

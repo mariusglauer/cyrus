@@ -384,6 +384,75 @@ describe("GitHubEventTransport", () => {
 			);
 		});
 
+		it("processes pull_request events with synchronize action", async () => {
+			const eventListener = vi.fn();
+			transport.on("event", eventListener);
+
+			const payload = {
+				action: "synchronize",
+				number: 42,
+				pull_request: {
+					number: 42,
+					title: "Update branch",
+					state: "open",
+					head: { ref: "feature/update", sha: "abc123" },
+					base: { ref: "main", sha: "base123" },
+					user: { login: "dev" },
+				},
+				repository: {
+					name: "web",
+					full_name: "acme/web",
+					owner: { login: "acme" },
+				},
+				sender: { login: "dev" },
+			};
+
+			const request = createMockRequest(payload, {
+				authorization: `Bearer ${testSecret}`,
+				"x-github-event": "pull_request",
+				"x-github-delivery": "delivery-pr-sync",
+			});
+			const reply = createMockReply();
+
+			const handler = mockFastify.routes["/github-webhook"]!;
+			await handler(request, reply);
+
+			expect(reply.code).toHaveBeenCalledWith(200);
+			expect(reply.send).toHaveBeenCalledWith({ success: true });
+			expect(eventListener).toHaveBeenCalledWith(
+				expect.objectContaining({
+					eventType: "pull_request",
+					deliveryId: "delivery-pr-sync",
+					payload,
+				}),
+			);
+		});
+
+		it("ignores pull_request events with closed action", async () => {
+			const eventListener = vi.fn();
+			transport.on("event", eventListener);
+
+			const request = createMockRequest(
+				{ action: "closed", number: 42 },
+				{
+					authorization: `Bearer ${testSecret}`,
+					"x-github-event": "pull_request",
+					"x-github-delivery": "delivery-pr-closed",
+				},
+			);
+			const reply = createMockReply();
+
+			const handler = mockFastify.routes["/github-webhook"]!;
+			await handler(request, reply);
+
+			expect(reply.code).toHaveBeenCalledWith(200);
+			expect(reply.send).toHaveBeenCalledWith({
+				success: true,
+				ignored: true,
+			});
+			expect(eventListener).not.toHaveBeenCalled();
+		});
+
 		it("ignores pull_request_review events with edited action", async () => {
 			const eventListener = vi.fn();
 			transport.on("event", eventListener);

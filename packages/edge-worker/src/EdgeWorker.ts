@@ -110,6 +110,8 @@ import {
 	type GitHubCommentWebhookEvent,
 	GitHubEventTransport,
 	type GitHubPullRequest,
+	type GitHubPullRequestPayload,
+	type GitHubPullRequestWebhookEvent,
 	type GitHubPushPayload,
 	type GitHubWebhookEvent,
 	isCommentOnPullRequest,
@@ -215,9 +217,11 @@ type RateLimitHeaders =
 	| { get(name: string): string | null };
 
 type AgentSessionQueueOrigin = "linear" | "github";
+type AgentSessionQueueTask = "agent-session" | "github-conflict-rebase";
 
 type AgentSessionQueueItem = {
 	origin: AgentSessionQueueOrigin;
+	task?: AgentSessionQueueTask;
 	workItemIdentifier: string;
 	sessionId: string;
 	queuedAt: number;
@@ -230,6 +234,7 @@ type AgentSessionQueueItem = {
 	webhook?: AgentSessionCreatedWebhook;
 	repoIds?: string[];
 	githubEvent?: GitHubCommentWebhookEvent;
+	githubPullRequestEvent?: GitHubPullRequestWebhookEvent;
 	githubRepositoryId?: string;
 };
 
@@ -1620,6 +1625,7 @@ export class EdgeWorker extends EventEmitter {
 				createTable(
 					[
 						{ label: "Origin", value: (row) => row.origin },
+						{ label: "Task", value: (row) => row.task },
 						{ label: "Task / PR", value: (row) => row.issueIdentifier, href: (row) => row.workItemUrl, code: true },
 						{ label: "Linear", value: (row) => row.linearIssueIdentifier, href: (row) => row.linearIssueUrl, code: true },
 						{ label: "Session", value: (row) => row.sessionId, code: true },
@@ -1639,6 +1645,7 @@ export class EdgeWorker extends EventEmitter {
 					[
 						{ label: "#", value: (row) => row.position },
 						{ label: "Origin", value: (row) => row.origin },
+						{ label: "Task", value: (row) => row.task },
 						{ label: "Task / PR", value: (row) => row.issueIdentifier, href: (row) => row.workItemUrl, code: true },
 						{ label: "Linear", value: (row) => row.linearIssueIdentifier, href: (row) => row.linearIssueUrl, code: true },
 						{ label: "Session", value: (row) => row.sessionId, code: true },
@@ -1770,14 +1777,23 @@ export class EdgeWorker extends EventEmitter {
 		this.gitHubEventTransport.on("event", (event: GitHubWebhookEvent) => {
 			// Route push events to the base branch notification handler
 			if (event.eventType === "push") {
-				this.handleGitHubPushWebhook(event.payload as GitHubPushPayload).catch(
-					(error) => {
-						this.logger.error(
-							"Failed to handle GitHub push webhook",
-							error instanceof Error ? error : new Error(String(error)),
-						);
-					},
-				);
+				this.handleGitHubPushWebhook(event).catch((error) => {
+					this.logger.error(
+						"Failed to handle GitHub push webhook",
+						error instanceof Error ? error : new Error(String(error)),
+					);
+				});
+				return;
+			}
+			if (event.eventType === "pull_request") {
+				this.handleGitHubPullRequestWebhook(
+					event as GitHubPullRequestWebhookEvent,
+				).catch((error) => {
+					this.logger.error(
+						"Failed to handle GitHub pull_request webhook",
+						error instanceof Error ? error : new Error(String(error)),
+					);
+				});
 				return;
 			}
 			this.enqueueGitHubAgentSession(event as GitHubCommentWebhookEvent).catch(
@@ -2853,8 +2869,9 @@ export class EdgeWorker extends EventEmitter {
 	 * branch and stream a rebase notification to the running agent.
 	 */
 	private async handleGitHubPushWebhook(
-		payload: GitHubPushPayload,
+		event: GitHubWebhookEvent,
 	): Promise<void> {
+		const payload = event.payload as GitHubPushPayload;
 		// Only handle branch pushes (refs/heads/*), not tags
 		if (!payload.ref.startsWith("refs/heads/")) {
 			return;
@@ -2887,19 +2904,17 @@ export class EdgeWorker extends EventEmitter {
 			this.logger.debug(
 				`No active sessions tracking base branch ${branchName} for ${repository.name}`,
 			);
-			return;
-		}
+		} else {
+			// Build a notification prompt with commit summary
+			const commitCount = payload.commits.length;
+			const commitSummary = payload.commits
+				.slice(0, 5)
+				.map((c) => `- ${c.message.split("\n")[0]}`)
+				.join("\n");
+			const moreCommits =
+				commitCount > 5 ? `\n- ... and ${commitCount - 5} more` : "";
 
-		// Build a notification prompt with commit summary
-		const commitCount = payload.commits.length;
-		const commitSummary = payload.commits
-			.slice(0, 5)
-			.map((c) => `- ${c.message.split("\n")[0]}`)
-			.join("\n");
-		const moreCommits =
-			commitCount > 5 ? `\n- ... and ${commitCount - 5} more` : "";
-
-		const notification = `<base_branch_update>
+			const notification = `<base_branch_update>
 <branch>${branchName}</branch>
 <repository>${repoFullName}</repository>
 <commit_count>${commitCount}</commit_count>
@@ -2912,40 +2927,538 @@ Your base branch \`${branchName}\` has received ${commitCount} new commit(s). Co
 </guidance>
 </base_branch_update>`;
 
-		this.logger.info(
-			`Base branch ${branchName} updated (${commitCount} commits) — notifying ${sessions.length} active session(s)`,
-		);
+			this.logger.info(
+				`Base branch ${branchName} updated (${commitCount} commits) — notifying ${sessions.length} active session(s)`,
+			);
 
-		// Stream notification to the first running session that supports streaming
-		const sortedSessions = [...sessions].sort(
-			(a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0),
-		);
+			// Stream notification to the first running session that supports streaming
+			const sortedSessions = [...sessions].sort(
+				(a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0),
+			);
 
-		for (const session of sortedSessions) {
-			const existingRunner = session.agentRunner;
-			const isRunning = existingRunner?.isRunning() || false;
+			for (const session of sortedSessions) {
+				const existingRunner = session.agentRunner;
+				const isRunning = existingRunner?.isRunning() || false;
 
-			if (
-				isRunning &&
-				existingRunner?.supportsStreamingInput &&
-				existingRunner.addStreamMessage
-			) {
-				// Best-effort notification; a steer-only backend may reject it if no
-				// turn is active. Don't let that throw out of the update handler.
-				try {
-					existingRunner.addStreamMessage(notification);
-					this.logger.debug(
-						`[base-branch-update] Streamed notification to session ${session.id} for branch ${branchName}`,
-					);
-					break;
-				} catch (error) {
-					this.logger.debug(
-						`[base-branch-update] Stream rejected for session ${session.id}; skipping`,
-						{ error: error instanceof Error ? error.message : String(error) },
-					);
+				if (
+					isRunning &&
+					existingRunner?.supportsStreamingInput &&
+					existingRunner.addStreamMessage
+				) {
+					// Best-effort notification; a steer-only backend may reject it if no
+					// turn is active. Don't let that throw out of the update handler.
+					try {
+						existingRunner.addStreamMessage(notification);
+						this.logger.debug(
+							`[base-branch-update] Streamed notification to session ${session.id} for branch ${branchName}`,
+						);
+						break;
+					} catch (error) {
+						this.logger.debug(
+							`[base-branch-update] Stream rejected for session ${session.id}; skipping`,
+							{
+								error: error instanceof Error ? error.message : String(error),
+							},
+						);
+					}
 				}
 			}
 		}
+
+		await this.scanGitHubPullRequestsForConflicts(
+			event,
+			repository,
+			branchName,
+		);
+	}
+
+	private async handleGitHubPullRequestWebhook(
+		event: GitHubPullRequestWebhookEvent,
+	): Promise<void> {
+		if (!this.isGitHubConflictRebaseEnabled()) {
+			this.logger.debug(
+				`Ignoring pull_request webhook for ${this.getGitHubPullRequestWorkItemIdentifier(event)} because conflict auto-rebase is disabled`,
+			);
+			return;
+		}
+
+		if (!this.isGitHubConflictRebaseAction(event.payload.action)) {
+			return;
+		}
+
+		const repository = this.findRepositoryByGitHubUrl(
+			extractRepoFullName(event),
+		);
+		if (!repository) {
+			this.logger.debug(
+				`No repository configured for GitHub pull_request from ${extractRepoFullName(event)}`,
+			);
+			return;
+		}
+
+		await this.enqueueGitHubConflictRebaseIfNeeded(
+			event,
+			repository,
+			"pull_request",
+		);
+	}
+
+	private async scanGitHubPullRequestsForConflicts(
+		event: GitHubWebhookEvent,
+		repository: RepositoryConfig,
+		baseBranch: string,
+	): Promise<void> {
+		if (!this.isGitHubConflictRebaseEnabled()) {
+			return;
+		}
+
+		const token = await this.resolveGitHubToken(event);
+		if (!token) {
+			this.logger.warn(
+				`Cannot scan ${extractRepoFullName(event)} PRs for conflicts: no GitHub token configured`,
+			);
+			return;
+		}
+
+		const pullRequests = await this.fetchOpenGitHubPullRequestsForBase(
+			event,
+			baseBranch,
+			token,
+		);
+		if (pullRequests.length === 0) {
+			return;
+		}
+
+		this.logger.info(
+			`Scanning ${pullRequests.length} open ${extractRepoFullName(event)} PR(s) targeting ${baseBranch} for merge conflicts`,
+		);
+
+		for (const pullRequest of pullRequests) {
+			const pullRequestEvent = this.buildSyntheticPullRequestEvent(
+				event,
+				pullRequest,
+			);
+			await this.enqueueGitHubConflictRebaseIfNeeded(
+				pullRequestEvent,
+				repository,
+				"base_branch_push",
+			);
+		}
+	}
+
+	private isGitHubConflictRebaseEnabled(): boolean {
+		const envValue = this.parseOptionalBooleanEnv(
+			process.env.CYRUS_GITHUB_CONFLICT_REBASE,
+		);
+		return envValue ?? this.config.githubConflictRebaseTrigger === true;
+	}
+
+	private shouldRebaseExternalGitHubPullRequests(): boolean {
+		const envValue = this.parseOptionalBooleanEnv(
+			process.env.CYRUS_GITHUB_CONFLICT_REBASE_INCLUDE_EXTERNAL_AUTHORS,
+		);
+		return (
+			envValue ??
+			this.config.githubConflictRebaseIncludeExternalAuthors === true
+		);
+	}
+
+	private parseOptionalBooleanEnv(value: string | undefined): boolean | null {
+		const normalized = value?.trim().toLowerCase();
+		if (!normalized) {
+			return null;
+		}
+		if (["1", "true", "yes", "on"].includes(normalized)) {
+			return true;
+		}
+		if (["0", "false", "no", "off"].includes(normalized)) {
+			return false;
+		}
+		return null;
+	}
+
+	private isGitHubConflictRebaseAction(
+		action: GitHubPullRequestPayload["action"],
+	): boolean {
+		return (
+			action === "opened" ||
+			action === "reopened" ||
+			action === "ready_for_review" ||
+			action === "synchronize" ||
+			action === "edited"
+		);
+	}
+
+	private async fetchOpenGitHubPullRequestsForBase(
+		event: GitHubWebhookEvent,
+		baseBranch: string,
+		token: string,
+	): Promise<GitHubPullRequest[]> {
+		const owner = extractRepoOwner(event);
+		const repo = extractRepoName(event);
+		const pullRequests: GitHubPullRequest[] = [];
+
+		for (let page = 1; page <= 5; page++) {
+			const url = new URL(
+				`https://api.github.com/repos/${owner}/${repo}/pulls`,
+			);
+			url.searchParams.set("state", "open");
+			url.searchParams.set("base", baseBranch);
+			url.searchParams.set("per_page", "100");
+			url.searchParams.set("page", String(page));
+
+			const response = await fetch(url, {
+				headers: {
+					Authorization: `Bearer ${token}`,
+					Accept: "application/vnd.github+json",
+					"X-GitHub-Api-Version": "2022-11-28",
+				},
+			});
+			if (!response.ok) {
+				const body = await response.text();
+				this.logger.warn(
+					`Failed to list open PRs for ${owner}/${repo}@${baseBranch}: ${response.status} ${response.statusText} - ${body}`,
+				);
+				return pullRequests;
+			}
+
+			const pageItems = (await response.json()) as GitHubPullRequest[];
+			pullRequests.push(...pageItems);
+			if (pageItems.length < 100) {
+				break;
+			}
+		}
+
+		return pullRequests;
+	}
+
+	private buildSyntheticPullRequestEvent(
+		sourceEvent: GitHubWebhookEvent,
+		pullRequest: GitHubPullRequest,
+	): GitHubPullRequestWebhookEvent {
+		const payload = sourceEvent.payload as GitHubPushPayload;
+		return {
+			eventType: "pull_request",
+			deliveryId: `${sourceEvent.deliveryId}-pr-${pullRequest.number}-${pullRequest.head.sha}`,
+			installationToken: sourceEvent.installationToken,
+			payload: {
+				action: "synchronize",
+				number: pullRequest.number,
+				pull_request: pullRequest,
+				repository: payload.repository,
+				sender: payload.sender,
+				installation: payload.installation,
+			},
+		};
+	}
+
+	private async fetchGitHubPullRequestDetails(
+		event: GitHubWebhookEvent,
+	): Promise<GitHubPullRequest | null> {
+		const prNumber = extractPRNumber(event);
+		if (!prNumber) {
+			return null;
+		}
+
+		const owner = extractRepoOwner(event);
+		const repo = extractRepoName(event);
+		const token = await this.resolveGitHubToken(event);
+		const headers: Record<string, string> = {
+			Accept: "application/vnd.github+json",
+			"X-GitHub-Api-Version": "2022-11-28",
+		};
+		if (token) {
+			headers.Authorization = `Bearer ${token}`;
+		}
+
+		for (let attempt = 0; attempt < 3; attempt++) {
+			const response = await fetch(
+				`https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`,
+				{ headers },
+			);
+			if (!response.ok) {
+				const body = await response.text();
+				this.logger.warn(
+					`Failed to fetch PR details for ${owner}/${repo}#${prNumber}: ${response.status} ${response.statusText} - ${body}`,
+				);
+				return null;
+			}
+
+			const pullRequest = (await response.json()) as GitHubPullRequest;
+			if (pullRequest.mergeable !== null || attempt === 2) {
+				return pullRequest;
+			}
+
+			await new Promise((resolve) => setTimeout(resolve, 1_000));
+		}
+
+		return null;
+	}
+
+	private isGitHubPullRequestMergeConflict(
+		pullRequest: GitHubPullRequest,
+	): boolean {
+		const mergeableState = pullRequest.mergeable_state?.toLowerCase();
+		return pullRequest.mergeable === false || mergeableState === "dirty";
+	}
+
+	private canAutoRebaseGitHubPullRequestHead(
+		pullRequest: GitHubPullRequest,
+		repository: RepositoryConfig,
+	): boolean {
+		const configuredRepo = repository.githubUrl
+			? this.getGitHubFullNameFromUrl(repository.githubUrl)
+			: undefined;
+		const baseRepo = pullRequest.base?.repo?.full_name;
+		const headRepo = pullRequest.head?.repo?.full_name;
+		const expectedRepo = configuredRepo ?? baseRepo;
+
+		return Boolean(
+			expectedRepo &&
+				baseRepo?.toLowerCase() === expectedRepo.toLowerCase() &&
+				headRepo?.toLowerCase() === expectedRepo.toLowerCase(),
+		);
+	}
+
+	private getGitHubFullNameFromUrl(url: string): string | undefined {
+		const normalized = url.trim().replace(/\.git$/, "");
+		const sshMatch = normalized.match(/github\.com[:/]([^/\s]+\/[^/\s]+)$/i);
+		if (sshMatch?.[1]) {
+			return sshMatch[1];
+		}
+		try {
+			const parsed = new URL(normalized);
+			if (!parsed.hostname.toLowerCase().endsWith("github.com")) {
+				return undefined;
+			}
+			const path = parsed.pathname.replace(/^\/+|\/+$/g, "");
+			return path.split("/").slice(0, 2).join("/") || undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
+	private async enqueueGitHubConflictRebaseIfNeeded(
+		event: GitHubPullRequestWebhookEvent,
+		repository: RepositoryConfig,
+		trigger: "pull_request" | "base_branch_push",
+	): Promise<void> {
+		const pullRequest =
+			(await this.fetchGitHubPullRequestDetails(event)) ??
+			event.payload.pull_request;
+		const workItemIdentifier =
+			this.getGitHubPullRequestWorkItemIdentifier(event);
+
+		if (this.isGitHubPullRequestTerminal(pullRequest)) {
+			this.logger.debug(
+				`Ignoring conflict rebase for terminal PR ${workItemIdentifier}`,
+			);
+			return;
+		}
+
+		if (!this.isGitHubPullRequestMergeConflict(pullRequest)) {
+			this.logger.debug(
+				`No merge conflict detected for ${workItemIdentifier} (${pullRequest.mergeable_state ?? "unknown"})`,
+			);
+			return;
+		}
+
+		if (
+			!this.shouldRebaseExternalGitHubPullRequests() &&
+			!this.isCyrusOwnedPullRequest(pullRequest)
+		) {
+			this.logger.info(
+				`Ignoring merge-conflicted PR ${workItemIdentifier} because it was not opened by Cyrus`,
+			);
+			return;
+		}
+
+		if (!this.canAutoRebaseGitHubPullRequestHead(pullRequest, repository)) {
+			if (trigger === "pull_request") {
+				await this.postGitHubPullRequestIssueComment(
+					event,
+					`Cyrus detected merge conflicts on this PR, but cannot automatically rebase it because the head branch is not in the configured repository. Please rebase \`${pullRequest.head.ref}\` onto \`${pullRequest.base.ref}\` manually or move the branch into the repository Cyrus can write to.`,
+				);
+			}
+			this.logger.info(
+				`Skipping conflict rebase for ${workItemIdentifier}: head branch is not writable by the configured repository checkout`,
+			);
+			return;
+		}
+
+		const sessionId = this.getGitHubConflictRebaseSessionId(event, pullRequest);
+		if (
+			this.linearSessionActiveItems.has(sessionId) ||
+			this.linearSessionQueue.some((item) => item.sessionId === sessionId)
+		) {
+			this.logger.info(
+				`Skipping duplicate GitHub conflict rebase queue item for ${workItemIdentifier}`,
+			);
+			return;
+		}
+
+		const body = `Cyrus detected merge conflicts between \`${pullRequest.head.ref}\` and \`${pullRequest.base.ref}\`. I am queueing an automatic rebase now and will push the rebased branch if the conflicts can be resolved safely.`;
+		await this.postGitHubPullRequestIssueComment(event, body);
+		await this.postGitHubLinkedLinearThoughtForPullRequestEvent(
+			event,
+			repository,
+			body,
+		);
+
+		const now = Date.now();
+		const item: AgentSessionQueueItem = {
+			origin: "github",
+			task: "github-conflict-rebase",
+			githubPullRequestEvent: {
+				...event,
+				payload: {
+					...event.payload,
+					pull_request: pullRequest,
+				},
+			},
+			githubRepositoryId: repository.id,
+			workItemIdentifier,
+			sessionId,
+			queuedAt: now,
+			availableAt: now,
+			retryCount: 0,
+		};
+
+		this.linearSessionQueue.push(item);
+		await this.saveLinearSessionQueue();
+		this.logger.info(
+			`Queued GitHub conflict rebase for ${workItemIdentifier} (${trigger})`,
+		);
+		this.drainLinearSessionQueue();
+	}
+
+	private getGitHubConflictRebaseSessionId(
+		event: GitHubPullRequestWebhookEvent,
+		pullRequest: GitHubPullRequest,
+	): string {
+		const repoSegment = extractRepoFullName(event).replace(
+			/[^A-Za-z0-9.-]+/g,
+			"-",
+		);
+		const shaSegment = (pullRequest.head.sha || "unknown").slice(0, 12);
+		return `github-conflict-rebase-${repoSegment}-${pullRequest.number}-${shaSegment}`;
+	}
+
+	private getGitHubPullRequestWorkItemIdentifier(
+		event: GitHubPullRequestWebhookEvent,
+	): string {
+		const prNumber = extractPRNumber(event);
+		return `${extractRepoFullName(event)}#${prNumber ?? "unknown"}`;
+	}
+
+	private async postGitHubPullRequestIssueComment(
+		event: GitHubWebhookEvent,
+		body: string,
+	): Promise<void> {
+		const prNumber = extractPRNumber(event);
+		if (!prNumber) {
+			return;
+		}
+
+		const token = await this.resolveGitHubToken(event);
+		if (!token) {
+			this.logger.warn(
+				`Cannot post GitHub PR comment for ${extractRepoFullName(event)}#${prNumber}: no token configured`,
+			);
+			return;
+		}
+
+		try {
+			await this.gitHubCommentService.postIssueComment({
+				token,
+				owner: extractRepoOwner(event),
+				repo: extractRepoName(event),
+				issueNumber: prNumber,
+				body,
+			});
+		} catch (error) {
+			this.logger.warn(
+				`Failed to post GitHub PR comment for ${extractRepoFullName(event)}#${prNumber}: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			);
+		}
+	}
+
+	private async postGitHubLinkedLinearThoughtForPullRequestEvent(
+		event: GitHubPullRequestWebhookEvent,
+		repository: RepositoryConfig,
+		body: string,
+	): Promise<void> {
+		const link = this.resolveLinearSessionLinkForGitHubPullRequest(
+			event.payload.pull_request,
+			repository,
+		);
+		if (!link) {
+			return;
+		}
+
+		await this.activityPoster.postThoughtActivity(
+			link.sessionId,
+			link.workspaceId,
+			body,
+		);
+	}
+
+	private resolveLinearSessionLinkForGitHubPullRequest(
+		pullRequest: GitHubPullRequest,
+		repository?: RepositoryConfig | null,
+	): LinearSessionLink | null {
+		const issueIdentifier = this.extractLinearIssueIdentifierFromText(
+			`${pullRequest.title ?? ""}\n${pullRequest.body ?? ""}\n${pullRequest.head?.ref ?? ""}`,
+		);
+		if (!issueIdentifier) {
+			return null;
+		}
+
+		const candidates = this.agentSessionManager
+			.getAllSessions()
+			.filter((session) => {
+				if (
+					session.issueContext?.trackerId !== "linear" ||
+					!session.externalSessionId
+				) {
+					return false;
+				}
+
+				const sessionIssueIdentifier =
+					session.issueContext.issueIdentifier ?? session.issue?.identifier;
+				if (sessionIssueIdentifier !== issueIdentifier) {
+					return false;
+				}
+
+				if (!repository) {
+					return true;
+				}
+
+				return session.repositories.some(
+					(repo) => repo.repositoryId === repository.id,
+				);
+			})
+			.sort((a, b) => b.updatedAt - a.updatedAt);
+
+		const session = candidates[0];
+		if (!session?.externalSessionId) {
+			return null;
+		}
+
+		const workspaceId =
+			repository?.linearWorkspaceId ??
+			this.resolveLinearWorkspaceIdForSession(session);
+		if (!workspaceId) {
+			return null;
+		}
+
+		return {
+			sessionId: session.externalSessionId,
+			workspaceId,
+			issueIdentifier,
+		};
 	}
 
 	/**
@@ -3325,6 +3838,40 @@ ${reviewBody}
 ${taskSection}`;
 	}
 
+	private buildGitHubConflictRebaseSystemPrompt(
+		event: GitHubPullRequestWebhookEvent,
+		pullRequest: GitHubPullRequest,
+	): string {
+		const repoFullName = extractRepoFullName(event);
+		const prNumber = pullRequest.number;
+		const branchRef = pullRequest.head.ref;
+		const baseBranchRef = pullRequest.base.ref;
+		const prTitle = pullRequest.title || "Untitled";
+
+		return `You are working on a GitHub Pull Request that currently has merge conflicts.
+
+## Context
+- **Repository**: ${repoFullName}
+- **PR**: #${prNumber} - ${prTitle}
+- **Branch**: ${branchRef}
+- **Base branch**: ${baseBranchRef}
+- **PR URL**: ${pullRequest.html_url}
+
+## Task
+Rebase the PR branch \`${branchRef}\` onto \`origin/${baseBranchRef}\`, resolve merge conflicts, and push the rebased branch.
+
+## Instructions
+- You are already checked out on the PR branch \`${branchRef}\`
+- Run \`git fetch origin\` before rebasing
+- Rebase with \`git rebase origin/${baseBranchRef}\`
+- Resolve only the conflicts caused by the rebase; keep the existing PR intent intact
+- Keep changes minimal and do not make unrelated product, formatting, or cleanup changes
+- Run focused checks that are relevant to touched files when practical
+- Push the rebased branch with \`git push --force-with-lease origin ${branchRef}\`
+- If the rebase cannot be completed safely, run \`git rebase --abort\`, leave the working tree clean, and explain the blocker
+- Respond with a concise summary suitable for posting to the GitHub PR`;
+	}
+
 	/**
 	 * Post a reply back to the GitHub PR comment after the session completes.
 	 */
@@ -3334,28 +3881,10 @@ ${taskSection}`;
 		_repository: RepositoryConfig,
 	): Promise<void> {
 		try {
-			// Get the last assistant message from the runner as the summary
-			const messages = runner.getMessages();
-			const lastAssistantMessage = [...messages]
-				.reverse()
-				.find((m) => m.type === "assistant");
-
-			let summary = "Task completed. Please review the changes on this branch.";
-			if (
-				lastAssistantMessage &&
-				lastAssistantMessage.type === "assistant" &&
-				"message" in lastAssistantMessage
-			) {
-				const msg = lastAssistantMessage as {
-					message: { content: Array<{ type: string; text?: string }> };
-				};
-				const textBlock = msg.message.content?.find(
-					(block) => block.type === "text" && block.text,
-				);
-				if (textBlock?.text) {
-					summary = textBlock.text;
-				}
-			}
+			const summary = this.extractRunnerSummary(
+				runner,
+				"Task completed. Please review the changes on this branch.",
+			);
 
 			const owner = extractRepoOwner(event);
 			const repo = extractRepoName(event);
@@ -3407,6 +3936,31 @@ ${taskSection}`;
 				error instanceof Error ? error : new Error(String(error)),
 			);
 		}
+	}
+
+	private extractRunnerSummary(runner: IAgentRunner, fallback: string): string {
+		const messages = runner.getMessages();
+		const lastAssistantMessage = [...messages]
+			.reverse()
+			.find((m) => m.type === "assistant");
+
+		if (
+			lastAssistantMessage &&
+			lastAssistantMessage.type === "assistant" &&
+			"message" in lastAssistantMessage
+		) {
+			const msg = lastAssistantMessage as {
+				message: { content: Array<{ type: string; text?: string }> };
+			};
+			const textBlock = msg.message.content?.find(
+				(block) => block.type === "text" && block.text,
+			);
+			if (textBlock?.text) {
+				return textBlock.text;
+			}
+		}
+
+		return fallback;
 	}
 
 	/**
@@ -4029,6 +4583,7 @@ ${taskSection}`;
 			activeItems: Array.from(this.linearSessionActiveItems.values()).map(
 				(item) => ({
 					origin: item.origin,
+					task: item.task ?? "agent-session",
 					sessionId: item.sessionId,
 					issueIdentifier: item.workItemIdentifier,
 					workItemUrl: this.getAgentQueueItemUrl(item),
@@ -4052,6 +4607,7 @@ ${taskSection}`;
 			),
 			pendingItems: this.linearSessionQueue.map((item, index) => ({
 				origin: item.origin,
+				task: item.task ?? "agent-session",
 				position: index + 1,
 				sessionId: item.sessionId,
 				issueIdentifier: item.workItemIdentifier,
@@ -4169,6 +4725,14 @@ ${taskSection}`;
 			);
 		}
 
+		if (item.origin === "github" && item.githubPullRequestEvent) {
+			return (
+				this.extractLinearIssueIdentifierFromText(
+					`${item.githubPullRequestEvent.payload.pull_request.title ?? ""}\n${item.githubPullRequestEvent.payload.pull_request.body ?? ""}\n${item.githubPullRequestEvent.payload.pull_request.head?.ref ?? ""}`,
+				) ?? null
+			);
+		}
+
 		return null;
 	}
 
@@ -4258,6 +4822,19 @@ ${taskSection}`;
 			}
 		}
 
+		if (item.origin === "github" && item.githubPullRequestEvent) {
+			const repository = this.findRepositoryByGitHubUrl(
+				extractRepoFullName(item.githubPullRequestEvent),
+			);
+			const workspaceSlug = repository?.linearWorkspaceId
+				? this.config.linearWorkspaces?.[repository.linearWorkspaceId]
+						?.linearWorkspaceSlug
+				: undefined;
+			if (workspaceSlug) {
+				return workspaceSlug;
+			}
+		}
+
 		const webhook = item.webhook as { organizationId?: unknown } | undefined;
 		const organizationId =
 			typeof webhook?.organizationId === "string"
@@ -4286,7 +4863,8 @@ ${taskSection}`;
 	}
 
 	private getGitHubQueueItemUrl(item: AgentSessionQueueItem): string | null {
-		const payload = item.githubEvent?.payload as
+		const payload = (item.githubEvent?.payload ??
+			item.githubPullRequestEvent?.payload) as
 			| {
 					pull_request?: { html_url?: unknown };
 					issue?: { html_url?: unknown };
@@ -4461,6 +5039,11 @@ ${taskSection}`;
 			}
 			addBranchName(
 				item.githubEvent ? extractPRBranchRef(item.githubEvent) : undefined,
+			);
+			addBranchName(
+				item.githubPullRequestEvent
+					? extractPRBranchRef(item.githubPullRequestEvent)
+					: undefined,
 			);
 		};
 
@@ -7144,11 +7727,167 @@ ${taskSection}`;
 	private async runQueuedGitHubSession(
 		item: AgentSessionQueueItem,
 	): Promise<void> {
+		if (item.task === "github-conflict-rebase") {
+			await this.runQueuedGitHubConflictRebaseSession(item);
+			return;
+		}
+
 		if (!item.githubEvent) {
 			throw new Error(`Missing GitHub webhook payload for ${item.sessionId}`);
 		}
 
 		await this.handleGitHubWebhook(item.githubEvent);
+	}
+
+	private async runQueuedGitHubConflictRebaseSession(
+		item: AgentSessionQueueItem,
+	): Promise<void> {
+		const event = item.githubPullRequestEvent;
+		if (!event) {
+			throw new Error(
+				`Missing GitHub pull_request payload for ${item.sessionId}`,
+			);
+		}
+
+		const repository =
+			(item.githubRepositoryId
+				? this.repositories.get(item.githubRepositoryId)
+				: undefined) ??
+			this.findRepositoryByGitHubUrl(extractRepoFullName(event));
+		if (!repository) {
+			throw new Error(
+				`No repository configured for GitHub repo ${extractRepoFullName(event)}`,
+			);
+		}
+
+		const pullRequest =
+			(await this.fetchGitHubPullRequestDetails(event)) ??
+			event.payload.pull_request;
+		if (!this.isGitHubPullRequestMergeConflict(pullRequest)) {
+			await this.postGitHubPullRequestIssueComment(
+				event,
+				`Cyrus checked this PR again before starting. GitHub no longer reports merge conflicts for \`${pullRequest.head.ref}\` against \`${pullRequest.base.ref}\`, so no rebase was needed.`,
+			);
+			return;
+		}
+
+		const branchRef = pullRequest.head.ref;
+		const baseBranchRef = pullRequest.base.ref;
+		const prNumber = pullRequest.number;
+		const repoFullName = extractRepoFullName(event);
+
+		const workspace = await this.createGitHubWorkspace(
+			repository,
+			branchRef,
+			prNumber,
+		);
+		if (!workspace) {
+			throw new Error(
+				`Failed to create workspace for ${repoFullName}#${prNumber}`,
+			);
+		}
+
+		const issueMinimal: IssueMinimal = {
+			id: `github-conflict-rebase-${repoFullName}#${prNumber}`,
+			identifier: `${extractRepoName(event)}#${prNumber}`,
+			title: pullRequest.title || `PR #${prNumber}`,
+			branchName: branchRef,
+		};
+
+		this.agentSessionManager.createCyrusAgentSession(
+			item.sessionId,
+			`github:${repoFullName}#${prNumber}`,
+			issueMinimal,
+			workspace,
+			"github",
+			[
+				{
+					repositoryId: repository.id,
+					branchName: branchRef,
+					baseBranchName: baseBranchRef,
+					githubUrl: repository.githubUrl,
+					githubReviewTeams: repository.githubReviewTeams,
+				},
+			],
+		);
+
+		this.sessionRepositories.set(item.sessionId, repository.id);
+		const activitySink = this.getActivitySinkForRepo(repository.id);
+		if (activitySink) {
+			this.agentSessionManager.setActivitySink(item.sessionId, activitySink);
+		}
+
+		const session = this.agentSessionManager.getSession(item.sessionId);
+		if (!session) {
+			throw new Error(`Failed to create session ${item.sessionId}`);
+		}
+
+		const linearSessionLink = this.resolveLinearSessionLinkForGitHubPullRequest(
+			pullRequest,
+			repository,
+		);
+		if (linearSessionLink) {
+			session.externalSessionId = linearSessionLink.sessionId;
+			await this.activityPoster.postThoughtActivity(
+				linearSessionLink.sessionId,
+				linearSessionLink.workspaceId,
+				`GitHub conflict rebase started for ${repoFullName}#${prNumber}.`,
+			);
+		}
+
+		const systemPrompt = this.buildGitHubConflictRebaseSystemPrompt(
+			event,
+			pullRequest,
+		);
+		const taskInstructions = `Rebase PR #${prNumber} branch \`${branchRef}\` onto \`origin/${baseBranchRef}\`, resolve merge conflicts only, and push the rebased branch with --force-with-lease.`;
+		const allowedTools =
+			this.toolPermissionResolver.buildGithubAllowedTools(repository);
+		const disallowedTools = this.buildDisallowedTools(repository);
+		const allowedDirectories: string[] = [repository.repositoryPath];
+
+		const { config: runnerConfig, runnerType } =
+			await this.buildAgentRunnerConfig(
+				session,
+				repository,
+				item.sessionId,
+				systemPrompt,
+				allowedTools,
+				allowedDirectories,
+				disallowedTools,
+				undefined,
+				undefined,
+				undefined,
+				80,
+				undefined,
+				this.buildSkillSessionContext(repository, undefined, session),
+				"github",
+			);
+
+		const runner = this.createRunnerForType(runnerType, runnerConfig);
+		this.agentSessionManager.addAgentRunner(item.sessionId, runner);
+		await this.savePersistedState();
+
+		this.logger.info(
+			`Starting ${runnerType} runner for GitHub conflict rebase ${repoFullName}#${prNumber}`,
+		);
+
+		try {
+			await runner.start(taskInstructions);
+			const summary = this.extractRunnerSummary(
+				runner,
+				"Conflict rebase completed. Please review the updated branch.",
+			);
+			await this.postGitHubPullRequestIssueComment(event, summary);
+			if (linearSessionLink) {
+				await this.activityPoster.postThoughtActivity(
+					linearSessionLink.sessionId,
+					linearSessionLink.workspaceId,
+					`GitHub conflict rebase completed for ${repoFullName}#${prNumber}.`,
+				);
+			}
+		} finally {
+			await this.savePersistedState();
+		}
 	}
 
 	private resolveLinearSessionQueueRepos(
@@ -7276,26 +8015,38 @@ ${taskSection}`;
 		item: AgentSessionQueueItem,
 		state: "queued" | "starting",
 	): Promise<void> {
-		if (!item.githubEvent) {
+		if (!item.githubEvent && !item.githubPullRequestEvent) {
 			return;
 		}
 
 		const waitingCount = this.linearSessionQueue.length;
+		const taskLabel =
+			item.task === "github-conflict-rebase"
+				? "GitHub conflict rebase"
+				: "GitHub follow-up";
 		const body =
 			state === "starting"
-				? `Starting GitHub follow-up for ${item.workItemIdentifier}.`
-				: `Queued GitHub follow-up for ${item.workItemIdentifier}. Cyrus is already running ${this.linearSessionActiveItems.size} task(s); ${waitingCount} task(s) are waiting.`;
+				? `Starting ${taskLabel} for ${item.workItemIdentifier}.`
+				: `Queued ${taskLabel} for ${item.workItemIdentifier}. Cyrus is already running ${this.linearSessionActiveItems.size} task(s); ${waitingCount} task(s) are waiting.`;
 
 		const repository = item.githubRepositoryId
 			? this.repositories.get(item.githubRepositoryId)
 			: null;
-		await this.postGitHubLinkedLinearThought(
-			item.githubEvent,
-			repository,
-			body,
-		);
+		if (item.githubEvent) {
+			await this.postGitHubLinkedLinearThought(
+				item.githubEvent,
+				repository,
+				body,
+			);
+		} else if (item.githubPullRequestEvent && repository) {
+			await this.postGitHubLinkedLinearThoughtForPullRequestEvent(
+				item.githubPullRequestEvent,
+				repository,
+				body,
+			);
+		}
 
-		if (state === "queued") {
+		if (state === "queued" && item.githubEvent) {
 			await this.postGitHubIssueComment(item.githubEvent, body);
 		}
 	}
@@ -7338,7 +8089,7 @@ ${taskSection}`;
 		item: AgentSessionQueueItem,
 		errorMessage: string,
 	): Promise<void> {
-		if (!item.githubEvent) {
+		if (!item.githubEvent && !item.githubPullRequestEvent) {
 			return;
 		}
 
@@ -7348,12 +8099,26 @@ ${taskSection}`;
 		const repository = item.githubRepositoryId
 			? this.repositories.get(item.githubRepositoryId)
 			: null;
-		await this.postGitHubLinkedLinearThought(
-			item.githubEvent,
-			repository,
-			body,
-		);
-		await this.postGitHubIssueComment(item.githubEvent, body);
+		if (item.githubEvent) {
+			await this.postGitHubLinkedLinearThought(
+				item.githubEvent,
+				repository,
+				body,
+			);
+			await this.postGitHubIssueComment(item.githubEvent, body);
+		} else if (item.githubPullRequestEvent) {
+			if (repository) {
+				await this.postGitHubLinkedLinearThoughtForPullRequestEvent(
+					item.githubPullRequestEvent,
+					repository,
+					body,
+				);
+			}
+			await this.postGitHubPullRequestIssueComment(
+				item.githubPullRequestEvent,
+				body,
+			);
+		}
 	}
 
 	private applyLinearRateLimitCooldown(error: unknown): boolean {
@@ -7489,7 +8254,9 @@ ${taskSection}`;
 				.filter(
 					(item) =>
 						item?.sessionId &&
-						(item?.webhook || item?.githubEvent) &&
+						(item?.webhook ||
+							item?.githubEvent ||
+							item?.githubPullRequestEvent) &&
 						(item.origin === "github" ||
 							item.origin === "linear" ||
 							!item.origin),
@@ -7509,6 +8276,11 @@ ${taskSection}`;
 					return {
 						...item,
 						origin: item.origin ?? "linear",
+						task:
+							item.task ??
+							(item.githubPullRequestEvent
+								? "github-conflict-rebase"
+								: "agent-session"),
 						workItemIdentifier:
 							item.workItemIdentifier ?? item.issueIdentifier ?? item.sessionId,
 						repoIds: Array.isArray(item.repoIds) ? item.repoIds : [],

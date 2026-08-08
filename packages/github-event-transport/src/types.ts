@@ -49,6 +49,7 @@ export interface GitHubWebhookEvent {
 	/** The full GitHub webhook payload */
 	payload:
 		| GitHubIssueCommentPayload
+		| GitHubPullRequestPayload
 		| GitHubPullRequestReviewCommentPayload
 		| GitHubPullRequestReviewPayload
 		| GitHubPushPayload;
@@ -61,14 +62,18 @@ export interface GitHubWebhookEvent {
  */
 export type GitHubEventType =
 	| "issue_comment"
+	| "pull_request"
 	| "pull_request_review_comment"
 	| "pull_request_review"
 	| "push";
 
 /**
- * Comment-related GitHub event types (excludes push)
+ * Comment-related GitHub event types (excludes non-comment events)
  */
-export type GitHubCommentEventType = Exclude<GitHubEventType, "push">;
+export type GitHubCommentEventType = Exclude<
+	GitHubEventType,
+	"push" | "pull_request"
+>;
 
 /**
  * Comment/review webhook event (excludes push events).
@@ -81,6 +86,17 @@ export interface GitHubCommentWebhookEvent {
 		| GitHubIssueCommentPayload
 		| GitHubPullRequestReviewCommentPayload
 		| GitHubPullRequestReviewPayload;
+	installationToken?: string;
+}
+
+/**
+ * Pull request webhook event.
+ * Used for PR lifecycle/status changes that are not comments.
+ */
+export interface GitHubPullRequestWebhookEvent {
+	eventType: "pull_request";
+	deliveryId: string;
+	payload: GitHubPullRequestPayload;
 	installationToken?: string;
 }
 
@@ -141,6 +157,7 @@ export interface GitHubPullRequestMinimal {
  */
 export interface GitHubPullRequest {
 	id: number;
+	node_id?: string;
 	number: number;
 	title: string;
 	body: string | null;
@@ -150,6 +167,12 @@ export interface GitHubPullRequest {
 	head: GitHubPullRequestRef;
 	base: GitHubPullRequestRef;
 	user: GitHubUser;
+	draft?: boolean;
+	maintainer_can_modify?: boolean;
+	mergeable?: boolean | null;
+	mergeable_state?: string;
+	merged?: boolean;
+	merged_at?: string | null;
 }
 
 /**
@@ -242,6 +265,40 @@ export interface GitHubReview {
 export interface GitHubPullRequestReviewPayload {
 	action: "submitted" | "edited" | "dismissed";
 	review: GitHubReview;
+	pull_request: GitHubPullRequest;
+	repository: GitHubRepository;
+	sender: GitHubUser;
+	installation?: GitHubInstallation;
+}
+
+/**
+ * Payload for pull_request webhook events
+ * @see https://docs.github.com/en/webhooks/webhook-events-and-payloads#pull_request
+ */
+export interface GitHubPullRequestPayload {
+	action:
+		| "assigned"
+		| "auto_merge_disabled"
+		| "auto_merge_enabled"
+		| "closed"
+		| "converted_to_draft"
+		| "demilestoned"
+		| "dequeued"
+		| "edited"
+		| "enqueued"
+		| "labeled"
+		| "locked"
+		| "milestoned"
+		| "opened"
+		| "ready_for_review"
+		| "reopened"
+		| "review_request_removed"
+		| "review_requested"
+		| "synchronize"
+		| "unassigned"
+		| "unlabeled"
+		| "unlocked";
+	number: number;
 	pull_request: GitHubPullRequest;
 	repository: GitHubRepository;
 	sender: GitHubUser;

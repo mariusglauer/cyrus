@@ -69,6 +69,8 @@ describe("EdgeWorker - GitHub review comments", () => {
 	let originalGitHubPrAuthorLogins: string | undefined;
 	let originalGitHubPrBranchPrefixes: string | undefined;
 	let originalGitHubBotUsername: string | undefined;
+	let originalGitHubConflictRebase: string | undefined;
+	let originalGitHubConflictRebaseExternalAuthors: string | undefined;
 
 	const mockRepository: RepositoryConfig = {
 		id: "test-repo",
@@ -118,6 +120,11 @@ describe("EdgeWorker - GitHub review comments", () => {
 		originalGitHubPrBranchPrefixes =
 			process.env.CYRUS_GITHUB_PR_BRANCH_PREFIXES;
 		originalGitHubBotUsername = process.env.GITHUB_BOT_USERNAME;
+		originalGitHubConflictRebase = process.env.CYRUS_GITHUB_CONFLICT_REBASE;
+		originalGitHubConflictRebaseExternalAuthors =
+			process.env.CYRUS_GITHUB_CONFLICT_REBASE_INCLUDE_EXTERNAL_AUTHORS;
+		delete process.env.CYRUS_GITHUB_CONFLICT_REBASE;
+		delete process.env.CYRUS_GITHUB_CONFLICT_REBASE_INCLUDE_EXTERNAL_AUTHORS;
 
 		mockConfig = {
 			platform: "linear",
@@ -142,6 +149,14 @@ describe("EdgeWorker - GitHub review comments", () => {
 			originalGitHubPrBranchPrefixes,
 		);
 		restoreEnvValue("GITHUB_BOT_USERNAME", originalGitHubBotUsername);
+		restoreEnvValue(
+			"CYRUS_GITHUB_CONFLICT_REBASE",
+			originalGitHubConflictRebase,
+		);
+		restoreEnvValue(
+			"CYRUS_GITHUB_CONFLICT_REBASE_INCLUDE_EXTERNAL_AUTHORS",
+			originalGitHubConflictRebaseExternalAuthors,
+		);
 		if (edgeWorker) {
 			try {
 				await edgeWorker.stop();
@@ -171,6 +186,85 @@ describe("EdgeWorker - GitHub review comments", () => {
 			},
 		},
 	});
+
+	const repositoryRef = {
+		id: 1,
+		name: "web",
+		full_name: "acme/web",
+		html_url: "https://github.com/acme/web",
+		clone_url: "https://github.com/acme/web.git",
+		ssh_url: "git@github.com:acme/web.git",
+		default_branch: "main",
+		owner: {
+			login: "acme",
+			id: 10,
+			avatar_url: "",
+			html_url: "https://github.com/acme",
+			type: "Organization",
+		},
+	};
+
+	const conflictedPullRequest = (overrides: Record<string, unknown> = {}) => ({
+		id: 12,
+		number: 12,
+		title: "FC-4172: Fix checkout",
+		body: "Linear issue: FC-4172",
+		state: "open",
+		html_url: "https://github.com/acme/web/pull/12",
+		url: "https://api.github.com/repos/acme/web/pulls/12",
+		head: {
+			label: "acme:feature/fc-4172-checkout",
+			ref: "feature/fc-4172-checkout",
+			sha: "abcdef1234567890",
+			repo: repositoryRef,
+		},
+		base: {
+			label: "acme:main",
+			ref: "main",
+			sha: "base123",
+			repo: repositoryRef,
+		},
+		user: {
+			login: "human-dev",
+			id: 20,
+			avatar_url: "",
+			html_url: "https://github.com/human-dev",
+			type: "User",
+		},
+		mergeable: false,
+		mergeable_state: "dirty",
+		merged: false,
+		merged_at: null,
+		...overrides,
+	});
+
+	const pullRequestEvent = (pullRequest: any) => ({
+		eventType: "pull_request",
+		deliveryId: "delivery-pr-conflict-1",
+		payload: {
+			action: "synchronize",
+			number: pullRequest.number,
+			pull_request: pullRequest,
+			repository: repositoryRef,
+			sender: pullRequest.user,
+		},
+	});
+
+	function stubConflictRebaseSideEffects(pullRequest: any) {
+		(edgeWorker as any).fetchGitHubPullRequestDetails = vi
+			.fn()
+			.mockResolvedValue(pullRequest);
+		(edgeWorker as any).postGitHubPullRequestIssueComment = vi
+			.fn()
+			.mockResolvedValue(undefined);
+		(edgeWorker as any).postGitHubLinkedLinearThoughtForPullRequestEvent = vi
+			.fn()
+			.mockResolvedValue(undefined);
+		(edgeWorker as any).saveLinearSessionQueue = vi
+			.fn()
+			.mockResolvedValue(undefined);
+		(edgeWorker as any).drainLinearSessionQueue = vi.fn();
+	}
 
 	it("adds inline review comments to change request instructions", async () => {
 		const fetchMock = vi.fn().mockResolvedValue({
@@ -208,6 +302,112 @@ describe("EdgeWorker - GitHub review comments", () => {
 		expect(instructions).toContain("## Inline Review Comments");
 		expect(instructions).toContain("src/checkout.ts:10-12");
 		expect(instructions).toContain("Use strict null handling here.");
+	});
+
+	it("ignores pull_request conflict checks when auto-rebase is disabled", async () => {
+		const enqueueSpy = vi.spyOn(
+			edgeWorker as any,
+			"enqueueGitHubConflictRebaseIfNeeded",
+		);
+
+		await (edgeWorker as any).handleGitHubPullRequestWebhook(
+			pullRequestEvent(conflictedPullRequest()),
+		);
+
+		expect(enqueueSpy).not.toHaveBeenCalled();
+	});
+
+	it("queues same-repository conflicted PRs from external authors when enabled", async () => {
+		(edgeWorker as any).config.githubConflictRebaseTrigger = true;
+		(edgeWorker as any).config.githubConflictRebaseIncludeExternalAuthors =
+			true;
+		const pullRequest = conflictedPullRequest();
+		stubConflictRebaseSideEffects(pullRequest);
+
+		await (edgeWorker as any).enqueueGitHubConflictRebaseIfNeeded(
+			pullRequestEvent(pullRequest),
+			mockRepository,
+			"pull_request",
+		);
+
+		expect(
+			(edgeWorker as any).postGitHubPullRequestIssueComment,
+		).toHaveBeenCalledWith(
+			expect.anything(),
+			expect.stringContaining("Cyrus detected merge conflicts"),
+		);
+		expect((edgeWorker as any).linearSessionQueue).toHaveLength(1);
+		expect((edgeWorker as any).linearSessionQueue[0]).toEqual(
+			expect.objectContaining({
+				origin: "github",
+				task: "github-conflict-rebase",
+				workItemIdentifier: "acme/web#12",
+				sessionId: "github-conflict-rebase-acme-web-12-abcdef123456",
+			}),
+		);
+		expect((edgeWorker as any).drainLinearSessionQueue).toHaveBeenCalled();
+	});
+
+	it("does not queue external-author conflicted PRs unless explicitly enabled", async () => {
+		(edgeWorker as any).config.githubConflictRebaseTrigger = true;
+		const pullRequest = conflictedPullRequest({
+			title: "Fix checkout",
+			body: null,
+			head: {
+				label: "acme:feature/checkout",
+				ref: "feature/checkout",
+				sha: "abcdef1234567890",
+				repo: repositoryRef,
+			},
+		});
+		stubConflictRebaseSideEffects(pullRequest);
+
+		await (edgeWorker as any).enqueueGitHubConflictRebaseIfNeeded(
+			pullRequestEvent(pullRequest),
+			mockRepository,
+			"pull_request",
+		);
+
+		expect(
+			(edgeWorker as any).postGitHubPullRequestIssueComment,
+		).not.toHaveBeenCalled();
+		expect((edgeWorker as any).linearSessionQueue).toHaveLength(0);
+	});
+
+	it("does not queue forked conflicted PRs because the configured checkout cannot push them", async () => {
+		(edgeWorker as any).config.githubConflictRebaseTrigger = true;
+		(edgeWorker as any).config.githubConflictRebaseIncludeExternalAuthors =
+			true;
+		const forkRepo = {
+			...repositoryRef,
+			full_name: "external/web",
+			owner: { ...repositoryRef.owner, login: "external" },
+		};
+		const pullRequest = conflictedPullRequest({
+			head: {
+				label: "external:feature/fc-4172-checkout",
+				ref: "feature/fc-4172-checkout",
+				sha: "abcdef1234567890",
+				repo: forkRepo,
+			},
+		});
+		stubConflictRebaseSideEffects(pullRequest);
+
+		await (edgeWorker as any).enqueueGitHubConflictRebaseIfNeeded(
+			pullRequestEvent(pullRequest),
+			mockRepository,
+			"pull_request",
+		);
+
+		expect(
+			(edgeWorker as any).postGitHubPullRequestIssueComment,
+		).toHaveBeenCalledWith(
+			expect.anything(),
+			expect.stringContaining(
+				"head branch is not in the configured repository",
+			),
+		);
+		expect((edgeWorker as any).linearSessionQueue).toHaveLength(0);
 	});
 
 	it("marks a GitHub PR as draft before follow-up work", async () => {

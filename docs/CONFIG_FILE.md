@@ -382,6 +382,27 @@ Sets default allowed tools for each prompt type across all repositories. Reposit
 
 Path to a script that runs for all repositories when creating new worktrees. See the main README for details on setup scripts.
 
+### `githubConflictRebaseTrigger` (boolean)
+
+When `true`, Cyrus listens for GitHub PRs that GitHub reports as having merge conflicts and queues an automatic rebase task. Defaults to `false`.
+
+```json
+{
+  "githubConflictRebaseTrigger": true
+}
+```
+
+### `githubConflictRebaseIncludeExternalAuthors` (boolean)
+
+When `true`, conflict rebase automation can also work on PRs not opened by Cyrus. Cyrus only queues the task when the PR head branch is in the configured repository so it can push the rebased branch safely. Defaults to `false`.
+
+```json
+{
+  "githubConflictRebaseTrigger": true,
+  "githubConflictRebaseIncludeExternalAuthors": true
+}
+```
+
 ---
 
 ## Tool Configuration Priority

@@ -9,6 +9,7 @@ import type {
 	GitHubEventTransportEvents,
 	GitHubEventType,
 	GitHubIssueCommentPayload,
+	GitHubPullRequestPayload,
 	GitHubPullRequestReviewCommentPayload,
 	GitHubPullRequestReviewPayload,
 	GitHubPushPayload,
@@ -40,6 +41,7 @@ export declare interface GitHubEventTransport {
  *
  * Supported GitHub event types:
  * - issue_comment: Comments on PR issues (top-level PR comments)
+ * - pull_request: PR lifecycle/status changes (used for conflict detection)
  * - pull_request_review_comment: Inline review comments on PR diffs
  * - pull_request_review: PR review submissions (e.g., changes_requested)
  * - push: Branch push events (used for base branch change notifications)
@@ -241,6 +243,7 @@ export class GitHubEventTransport extends EventEmitter {
 
 		if (
 			eventType !== "issue_comment" &&
+			eventType !== "pull_request" &&
 			eventType !== "pull_request_review_comment" &&
 			eventType !== "pull_request_review" &&
 			eventType !== "push"
@@ -252,6 +255,7 @@ export class GitHubEventTransport extends EventEmitter {
 
 		const payload = request.body as
 			| GitHubIssueCommentPayload
+			| GitHubPullRequestPayload
 			| GitHubPullRequestReviewCommentPayload
 			| GitHubPullRequestReviewPayload
 			| GitHubPushPayload;
@@ -259,6 +263,21 @@ export class GitHubEventTransport extends EventEmitter {
 		// Push events don't have an action field — always emit them
 		if (eventType === "push") {
 			// No action filtering needed for push events
+		} else if (eventType === "pull_request") {
+			const action = (payload as GitHubPullRequestPayload).action;
+			if (
+				action !== "opened" &&
+				action !== "reopened" &&
+				action !== "ready_for_review" &&
+				action !== "synchronize" &&
+				action !== "edited"
+			) {
+				this.logger.debug(
+					`Ignoring ${eventType} with action: ${(payload as GitHubPullRequestPayload).action}`,
+				);
+				reply.code(200).send({ success: true, ignored: true });
+				return;
+			}
 		} else if (eventType === "pull_request_review") {
 			// For pull_request_review, handle 'submitted' action (not 'created')
 			if ((payload as GitHubPullRequestReviewPayload).action !== "submitted") {

@@ -5,6 +5,7 @@
 import type {
 	GitHubCommentWebhookEvent,
 	GitHubIssueCommentPayload,
+	GitHubPullRequestPayload,
 	GitHubPullRequestReviewCommentPayload,
 	GitHubPullRequestReviewPayload,
 	GitHubWebhookEvent,
@@ -38,6 +39,19 @@ export function isPullRequestReviewPayload(
 }
 
 /**
+ * Type guard for pull_request payloads
+ */
+export function isPullRequestPayload(
+	payload: GitHubWebhookEvent["payload"],
+): payload is GitHubPullRequestPayload {
+	return (
+		"pull_request" in payload &&
+		!("comment" in payload) &&
+		!("review" in payload)
+	);
+}
+
+/**
  * Extract the PR branch name from a GitHub webhook event.
  *
  * For issue_comment: We need to use the issue.pull_request URL to determine the PR,
@@ -51,6 +65,9 @@ export function extractPRBranchRef(event: GitHubWebhookEvent): string | null {
 		return event.payload.pull_request.head.ref;
 	}
 	if (isPullRequestReviewCommentPayload(event.payload)) {
+		return event.payload.pull_request.head.ref;
+	}
+	if (isPullRequestPayload(event.payload)) {
 		return event.payload.pull_request.head.ref;
 	}
 	// For issue_comment, the branch ref is not in the payload
@@ -76,6 +93,9 @@ export function extractPRBaseBranchRef(
 	if (isPullRequestReviewCommentPayload(event.payload)) {
 		return event.payload.pull_request.base.ref;
 	}
+	if (isPullRequestPayload(event.payload)) {
+		return event.payload.pull_request.base.ref;
+	}
 	// For issue_comment, the base ref is not in the payload
 	// The caller needs to fetch it from the PR API
 	return null;
@@ -98,6 +118,10 @@ export function extractPRNumber(event: GitHubWebhookEvent): number | null {
 	}
 
 	if (isPullRequestReviewCommentPayload(event.payload)) {
+		return event.payload.pull_request.number;
+	}
+
+	if (isPullRequestPayload(event.payload)) {
 		return event.payload.pull_request.number;
 	}
 
@@ -174,7 +198,7 @@ export function isCommentOnPullRequest(event: GitHubWebhookEvent): boolean {
 	if (isIssueCommentPayload(event.payload)) {
 		return !!event.payload.issue.pull_request;
 	}
-	// pull_request_review_comment and pull_request_review are always on a PR
+	// pull_request, pull_request_review_comment, and pull_request_review are always on a PR
 	return true;
 }
 
@@ -218,6 +242,9 @@ export function extractPRTitle(event: GitHubWebhookEvent): string | null {
 		return event.payload.pull_request.title;
 	}
 	if (isPullRequestReviewCommentPayload(event.payload)) {
+		return event.payload.pull_request.title;
+	}
+	if (isPullRequestPayload(event.payload)) {
 		return event.payload.pull_request.title;
 	}
 	return null;
