@@ -1153,6 +1153,28 @@ export class EdgeWorker extends EventEmitter {
 		});
 
 		fastify.post(
+			"/agent-queue/github-conflict-rebase/scan",
+			async (request, reply) => {
+				if (!this.isLoopbackRequestAddress(request.ip)) {
+					return reply.status(403).send({
+						ok: false,
+						error:
+							"Conflict rebase scans can only be triggered locally on the Cyrus host.",
+					});
+				}
+
+				const body = request.body as
+					| { repositoryId?: string; baseBranch?: string }
+					| undefined;
+				const result = await this.scanConfiguredGitHubPullRequestsForConflicts({
+					repositoryId: body?.repositoryId,
+					baseBranch: body?.baseBranch,
+				});
+				return reply.status(result.statusCode).send(result.body);
+			},
+		);
+
+		fastify.post(
 			"/agent-queue/:sessionId/prioritize",
 			async (request, reply) => {
 				const params = request.params as { sessionId?: string };
@@ -1190,7 +1212,17 @@ export class EdgeWorker extends EventEmitter {
 		this.logger.info("   Route: GET /status");
 		this.logger.info("   Route: GET /linear-queue");
 		this.logger.info("   Route: GET /agent-queue");
+		this.logger.info("   Route: POST /agent-queue/github-conflict-rebase/scan");
 		this.logger.info("   Route: POST /agent-queue/:sessionId/prioritize");
+	}
+
+	private isLoopbackRequestAddress(address: string | undefined): boolean {
+		const normalized = address?.trim().toLowerCase();
+		return (
+			normalized === "127.0.0.1" ||
+			normalized === "::1" ||
+			normalized === "::ffff:127.0.0.1"
+		);
 	}
 
 	private renderDashboardHtml(): string {
@@ -2888,11 +2920,13 @@ export class EdgeWorker extends EventEmitter {
 		// Find the matching repository config
 		const repository = this.findRepositoryByGitHubUrl(repoFullName);
 		if (!repository) {
-			this.logger.debug(
+			this.logger.info(
 				`No repository configured for GitHub push from ${repoFullName}`,
 			);
 			return;
 		}
+
+		this.logger.info(`Handling GitHub push for ${repoFullName}@${branchName}`);
 
 		// Find active sessions tracking this branch as their base branch
 		const sessions = this.agentSessionManager.getSessionsByBaseBranch(
@@ -3009,8 +3043,15 @@ Your base branch \`${branchName}\` has received ${commitCount} new commit(s). Co
 		baseBranch: string,
 	): Promise<void> {
 		if (!this.isGitHubConflictRebaseEnabled()) {
+			this.logger.info(
+				`Skipping GitHub conflict rebase scan for ${extractRepoFullName(event)}@${baseBranch}: disabled`,
+			);
 			return;
 		}
+
+		this.logger.info(
+			`Starting GitHub conflict rebase scan for ${extractRepoFullName(event)}@${baseBranch}`,
+		);
 
 		const token = await this.resolveGitHubToken(event);
 		if (!token) {
@@ -3024,6 +3065,9 @@ Your base branch \`${branchName}\` has received ${commitCount} new commit(s). Co
 			event,
 			baseBranch,
 			token,
+		);
+		this.logger.info(
+			`Listed ${pullRequests.length} open ${extractRepoFullName(event)} PR(s) targeting ${baseBranch}`,
 		);
 		if (pullRequests.length === 0) {
 			return;
@@ -3044,6 +3088,157 @@ Your base branch \`${branchName}\` has received ${commitCount} new commit(s). Co
 				"base_branch_push",
 			);
 		}
+	}
+
+	private async scanConfiguredGitHubPullRequestsForConflicts(input: {
+		repositoryId?: string;
+		baseBranch?: string;
+	}): Promise<{ statusCode: number; body: unknown }> {
+		if (!this.isGitHubConflictRebaseEnabled()) {
+			return {
+				statusCode: 409,
+				body: {
+					ok: false,
+					error: "GitHub conflict auto-rebase is disabled.",
+				},
+			};
+		}
+
+		const requestedRepositoryId = input.repositoryId?.trim();
+		const requestedBaseBranch = input.baseBranch?.trim();
+		const repositories = requestedRepositoryId
+			? [this.repositories.get(requestedRepositoryId)].filter(
+					(repository): repository is RepositoryConfig => Boolean(repository),
+				)
+			: Array.from(this.repositories.values()).filter((repository) =>
+					Boolean(repository.githubUrl),
+				);
+
+		if (repositories.length === 0) {
+			return {
+				statusCode: requestedRepositoryId ? 404 : 400,
+				body: {
+					ok: false,
+					error: requestedRepositoryId
+						? "Repository not found."
+						: "No GitHub repositories configured.",
+				},
+			};
+		}
+
+		const results: Array<{
+			repositoryId: string;
+			repository: string;
+			baseBranch: string;
+			queued: number;
+			skipped?: string;
+			error?: string;
+		}> = [];
+
+		for (const repository of repositories) {
+			const repoFullName = repository.githubUrl
+				? this.getGitHubFullNameFromUrl(repository.githubUrl)
+				: undefined;
+			const baseBranch = requestedBaseBranch || repository.baseBranch;
+
+			if (!repoFullName) {
+				results.push({
+					repositoryId: repository.id,
+					repository: repository.githubUrl ?? repository.name,
+					baseBranch,
+					queued: 0,
+					skipped: "Repository has no parseable GitHub URL.",
+				});
+				continue;
+			}
+
+			const beforeQueueLength = this.linearSessionQueue.length;
+			try {
+				await this.scanGitHubPullRequestsForConflicts(
+					this.buildSyntheticGitHubPushEvent(repoFullName, baseBranch),
+					repository,
+					baseBranch,
+				);
+				results.push({
+					repositoryId: repository.id,
+					repository: repoFullName,
+					baseBranch,
+					queued: Math.max(
+						0,
+						this.linearSessionQueue.length - beforeQueueLength,
+					),
+				});
+			} catch (error) {
+				results.push({
+					repositoryId: repository.id,
+					repository: repoFullName,
+					baseBranch,
+					queued: Math.max(
+						0,
+						this.linearSessionQueue.length - beforeQueueLength,
+					),
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+
+		return {
+			statusCode: 200,
+			body: {
+				ok: true,
+				results,
+				queue: this.buildLinearQueueStatus(),
+			},
+		};
+	}
+
+	private buildSyntheticGitHubPushEvent(
+		repoFullName: string,
+		baseBranch: string,
+	): GitHubWebhookEvent {
+		const [owner = "unknown", repo = "unknown"] = repoFullName.split("/");
+		const syntheticUser = {
+			login: "cyrus",
+			id: 0,
+			avatar_url: "",
+			html_url: "https://github.com/cyrus",
+			type: "Bot",
+		};
+		const payload: GitHubPushPayload = {
+			ref: `refs/heads/${baseBranch}`,
+			deleted: false,
+			created: false,
+			forced: false,
+			compare: "",
+			before: "",
+			after: "",
+			commits: [],
+			head_commit: null,
+			repository: {
+				id: 0,
+				name: repo,
+				full_name: repoFullName,
+				html_url: `https://github.com/${repoFullName}`,
+				clone_url: `https://github.com/${repoFullName}.git`,
+				ssh_url: `git@github.com:${repoFullName}.git`,
+				default_branch: baseBranch,
+				owner: {
+					login: owner,
+					id: 0,
+					avatar_url: "",
+					html_url: `https://github.com/${owner}`,
+					type: "Organization",
+				},
+			},
+			pusher: { name: "cyrus", email: "cyrus@localhost" },
+			sender: syntheticUser,
+		};
+
+		return {
+			eventType: "push",
+			deliveryId: `manual-conflict-scan-${Date.now()}`,
+			payload,
+		};
 	}
 
 	private isGitHubConflictRebaseEnabled(): boolean {

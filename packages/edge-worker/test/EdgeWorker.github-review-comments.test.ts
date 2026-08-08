@@ -35,6 +35,7 @@ vi.mock("../src/AgentSessionManager.js", () => ({
 			getAllAgentRunners: vi.fn().mockReturnValue([]),
 			getAllSessions: vi.fn().mockReturnValue([]),
 			getActiveSessionsByIssueId: vi.fn().mockReturnValue([]),
+			getSessionsByBaseBranch: vi.fn().mockReturnValue([]),
 			createCyrusAgentSession: vi.fn(),
 			getSession: vi.fn(),
 			setActivitySink: vi.fn(),
@@ -80,6 +81,7 @@ describe("EdgeWorker - GitHub review comments", () => {
 		baseBranch: "main",
 		linearWorkspaceId: "test-workspace",
 		isActive: true,
+		githubUrl: "git@github.com:acme/web.git",
 	};
 
 	const reviewEvent = {
@@ -250,6 +252,24 @@ describe("EdgeWorker - GitHub review comments", () => {
 		},
 	});
 
+	const pushEvent = (overrides: Record<string, unknown> = {}) => ({
+		eventType: "push",
+		deliveryId: "delivery-push-1",
+		payload: {
+			ref: "refs/heads/main",
+			deleted: false,
+			commits: [
+				{
+					message: "Merge pull request #1202",
+				},
+			],
+			compare: "https://github.com/acme/web/compare/base...head",
+			repository: repositoryRef,
+			sender: { login: "mariusglauer" },
+			...overrides,
+		},
+	});
+
 	function stubConflictRebaseSideEffects(pullRequest: any) {
 		(edgeWorker as any).fetchGitHubPullRequestDetails = vi
 			.fn()
@@ -346,6 +366,31 @@ describe("EdgeWorker - GitHub review comments", () => {
 			}),
 		);
 		expect((edgeWorker as any).drainLinearSessionQueue).toHaveBeenCalled();
+	});
+
+	it("scans open PRs for conflicts when a configured base branch receives a push", async () => {
+		(edgeWorker as any).config.githubConflictRebaseTrigger = true;
+		(edgeWorker as any).config.githubConflictRebaseIncludeExternalAuthors =
+			true;
+		const pullRequest = conflictedPullRequest();
+		(edgeWorker as any).fetchOpenGitHubPullRequestsForBase = vi
+			.fn()
+			.mockResolvedValue([pullRequest]);
+		stubConflictRebaseSideEffects(pullRequest);
+
+		await (edgeWorker as any).handleGitHubPushWebhook(pushEvent());
+
+		expect(
+			(edgeWorker as any).fetchOpenGitHubPullRequestsForBase,
+		).toHaveBeenCalledWith(expect.anything(), "main", "token");
+		expect((edgeWorker as any).linearSessionQueue).toHaveLength(1);
+		expect((edgeWorker as any).linearSessionQueue[0]).toEqual(
+			expect.objectContaining({
+				origin: "github",
+				task: "github-conflict-rebase",
+				workItemIdentifier: "acme/web#12",
+			}),
+		);
 	});
 
 	it("does not queue external-author conflicted PRs unless explicitly enabled", async () => {
