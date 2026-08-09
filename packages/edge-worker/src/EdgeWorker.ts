@@ -273,9 +273,12 @@ type GarbageCollectionSummary = {
 	removedTempDirs: number;
 	removedSessions: number;
 	removedRegistrySessions: number;
+	removedInactiveWorktrees: number;
 	skippedProtected: number;
 	skippedOpenPullRequests: number;
 	skippedUnknownPullRequests: number;
+	skippedFreshWorktrees: number;
+	skippedDirtyWorktrees: number;
 	skippedBecauseBusy?: boolean;
 	errors: string[];
 };
@@ -299,6 +302,8 @@ type PullRequestGarbageCollectionState = {
 	url?: string;
 	headRefName?: string;
 };
+
+type InactiveWorktreeRemovalBlocker = "fresh" | "dirty" | "stat";
 
 type LinearSessionLink = {
 	sessionId: string;
@@ -348,6 +353,7 @@ export class EdgeWorker extends EventEmitter {
 	private linearSessionActiveItems: Map<string, AgentSessionQueueItem> =
 		new Map();
 	private linearSessionQueueFile: string;
+	private linearSessionQueueSavePromise: Promise<void> = Promise.resolve();
 	private linearSessionQueueDrainTimer: NodeJS.Timeout | null = null;
 	private operationalMonitorTimer: NodeJS.Timeout | null = null;
 	private garbageCollectionTimer: NodeJS.Timeout | null = null;
@@ -410,6 +416,11 @@ export class EdgeWorker extends EventEmitter {
 			process.env.CYRUS_GC_TERMINAL_PR_GRACE_MS || "3600000",
 			10,
 		) || 3_600_000,
+	);
+	private readonly garbageCollectionWorktreeTtlMs = Math.max(
+		600_000,
+		Number.parseInt(process.env.CYRUS_GC_WORKTREE_TTL_MS || "3600000", 10) ||
+			3_600_000,
 	);
 	private readonly garbageCollectionDeleteRemoteBranches =
 		process.env.CYRUS_GC_DELETE_REMOTE_BRANCHES?.toLowerCase().trim() ===
@@ -1152,6 +1163,32 @@ export class EdgeWorker extends EventEmitter {
 			return reply.status(200).send(this.buildLinearQueueStatus());
 		});
 
+		fastify.post("/agent-queue/gc", async (request, reply) => {
+			if (!this.isLoopbackRequestAddress(request.ip)) {
+				return reply.status(403).send({
+					ok: false,
+					error:
+						"Garbage collection can only be triggered locally on the Cyrus host.",
+				});
+			}
+
+			const body = request.body as
+				| { reason?: string; ignoreBusy?: boolean }
+				| undefined;
+			const reason = body?.reason?.trim() || "manual";
+			await this.runGarbageCollection(reason, {
+				ignoreBusy: body?.ignoreBusy ?? true,
+			});
+			const disk = await this.getDiskAvailability(this.cyrusHome).catch(
+				() => null,
+			);
+			return reply.status(200).send({
+				ok: true,
+				garbageCollection: this.lastGarbageCollectionSummary,
+				disk,
+			});
+		});
+
 		fastify.post(
 			"/agent-queue/github-conflict-rebase/scan",
 			async (request, reply) => {
@@ -1212,6 +1249,7 @@ export class EdgeWorker extends EventEmitter {
 		this.logger.info("   Route: GET /status");
 		this.logger.info("   Route: GET /linear-queue");
 		this.logger.info("   Route: GET /agent-queue");
+		this.logger.info("   Route: POST /agent-queue/gc");
 		this.logger.info("   Route: POST /agent-queue/github-conflict-rebase/scan");
 		this.logger.info("   Route: POST /agent-queue/:sessionId/prioritize");
 	}
@@ -4731,6 +4769,7 @@ ${taskSection}`;
 				intervalMs: this.garbageCollectionIntervalMs,
 				sessionTtlMs: this.garbageCollectionSessionTtlMs,
 				terminalPrGraceMs: this.garbageCollectionTerminalPrGraceMs,
+				worktreeTtlMs: this.garbageCollectionWorktreeTtlMs,
 				deleteRemoteBranches: this.garbageCollectionDeleteRemoteBranches,
 				runWhenBusy: this.garbageCollectionRunWhenBusy,
 				maxRemovalsPerRun: this.garbageCollectionMaxRemovalsPerRun,
@@ -5148,9 +5187,12 @@ ${taskSection}`;
 			removedTempDirs: 0,
 			removedSessions: 0,
 			removedRegistrySessions: 0,
+			removedInactiveWorktrees: 0,
 			skippedProtected: 0,
 			skippedOpenPullRequests: 0,
 			skippedUnknownPullRequests: 0,
+			skippedFreshWorktrees: 0,
+			skippedDirtyWorktrees: 0,
 			errors: [],
 		};
 
@@ -5334,7 +5376,24 @@ ${taskSection}`;
 
 			const branchRefs = this.listWorktreeBranchRefs(workspacePath);
 			if (branchRefs.length === 0) {
-				summary.skippedUnknownPullRequests++;
+				const blocker = await this.getInactiveWorktreeRemovalBlocker(
+					workspacePath,
+					branchRefs,
+				);
+				if (blocker) {
+					if (blocker === "stat") {
+						summary.skippedUnknownPullRequests++;
+					} else {
+						this.recordInactiveWorktreeRemovalBlocker(blocker, summary);
+					}
+					continue;
+				}
+
+				await this.deleteGarbageCollectedWorktree(
+					issueIdentifier,
+					summary,
+					true,
+				);
 				continue;
 			}
 
@@ -5342,16 +5401,21 @@ ${taskSection}`;
 				ref: WorktreeBranchRef;
 				pr: PullRequestGarbageCollectionState;
 			}> = [];
-			let canDeleteWorkspace = true;
+			let hasProtectedBranch = false;
+			let hasOpenPullRequest = false;
+			let hasUnknownPullRequest = false;
+			let hasNonCyrusBranch = false;
 
 			for (const ref of branchRefs) {
-				if (
-					this.isProtectedBranch(ref.branch, protection) ||
-					!this.isCyrusGarbageCollectionBranch(ref.branch, issueIdentifier)
-				) {
+				if (this.isProtectedBranch(ref.branch, protection)) {
 					summary.skippedProtected++;
-					canDeleteWorkspace = false;
+					hasProtectedBranch = true;
 					break;
+				}
+
+				if (!this.isCyrusGarbageCollectionBranch(ref.branch, issueIdentifier)) {
+					hasNonCyrusBranch = true;
+					continue;
 				}
 
 				const pr = this.getPullRequestGarbageCollectionState(
@@ -5359,26 +5423,27 @@ ${taskSection}`;
 					ref.branch,
 				);
 				if (!pr) {
-					summary.skippedUnknownPullRequests++;
-					canDeleteWorkspace = false;
-					break;
+					hasUnknownPullRequest = true;
+					continue;
 				}
 				if (!this.isTerminalPullRequestEligibleForGarbageCollection(pr)) {
-					summary.skippedOpenPullRequests++;
-					canDeleteWorkspace = false;
-					break;
+					hasOpenPullRequest = true;
+					continue;
 				}
 
 				terminalRefs.push({ ref, pr });
 			}
 
-			if (!canDeleteWorkspace || terminalRefs.length === 0) {
+			if (hasProtectedBranch) {
 				continue;
 			}
 
-			try {
-				this.gitService.deleteWorktree(issueIdentifier);
-				summary.removedWorktrees++;
+			if (terminalRefs.length === branchRefs.length) {
+				await this.deleteGarbageCollectedWorktree(
+					issueIdentifier,
+					summary,
+					false,
+				);
 				for (const { ref, pr } of terminalRefs) {
 					this.deleteGarbageCollectedBranch(
 						ref.repoPath,
@@ -5387,12 +5452,85 @@ ${taskSection}`;
 						summary,
 					);
 				}
-			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
-				summary.errors.push(
-					`Failed to remove worktree ${issueIdentifier}: ${message}`,
-				);
+				continue;
 			}
+
+			const blocker = await this.getInactiveWorktreeRemovalBlocker(
+				workspacePath,
+				branchRefs,
+			);
+			if (!blocker) {
+				await this.deleteGarbageCollectedWorktree(
+					issueIdentifier,
+					summary,
+					true,
+				);
+				continue;
+			}
+
+			if (blocker === "stat") {
+				if (hasOpenPullRequest) {
+					summary.skippedOpenPullRequests++;
+				} else if (hasUnknownPullRequest || hasNonCyrusBranch) {
+					summary.skippedUnknownPullRequests++;
+				}
+			} else {
+				this.recordInactiveWorktreeRemovalBlocker(blocker, summary);
+			}
+		}
+	}
+
+	private async deleteGarbageCollectedWorktree(
+		issueIdentifier: string,
+		summary: GarbageCollectionSummary,
+		inactiveOnly: boolean,
+	): Promise<void> {
+		try {
+			await this.gitService.deleteWorktree(issueIdentifier);
+			summary.removedWorktrees++;
+			if (inactiveOnly) {
+				summary.removedInactiveWorktrees++;
+			}
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			summary.errors.push(
+				`Failed to remove worktree ${issueIdentifier}: ${message}`,
+			);
+		}
+	}
+
+	private async getInactiveWorktreeRemovalBlocker(
+		workspacePath: string,
+		branchRefs: WorktreeBranchRef[],
+	): Promise<InactiveWorktreeRemovalBlocker | null> {
+		const info = await stat(workspacePath).catch(() => undefined);
+		if (!info) {
+			return "stat";
+		}
+
+		if (Date.now() - info.mtimeMs < this.garbageCollectionWorktreeTtlMs) {
+			return "fresh";
+		}
+
+		for (const ref of branchRefs) {
+			if (!this.isGitWorktreeClean(ref.path)) {
+				return "dirty";
+			}
+		}
+
+		return null;
+	}
+
+	private recordInactiveWorktreeRemovalBlocker(
+		blocker: InactiveWorktreeRemovalBlocker,
+		summary: GarbageCollectionSummary,
+	): void {
+		if (blocker === "fresh") {
+			summary.skippedFreshWorktrees++;
+			return;
+		}
+		if (blocker === "dirty") {
+			summary.skippedDirtyWorktrees++;
 		}
 	}
 
@@ -5549,6 +5687,11 @@ ${taskSection}`;
 		} catch {
 			return null;
 		}
+	}
+
+	private isGitWorktreeClean(cwd: string): boolean {
+		const output = this.readGitOutput(cwd, ["status", "--porcelain"]);
+		return output === "";
 	}
 
 	private getPullRequestGarbageCollectionState(
@@ -8622,6 +8765,14 @@ ${taskSection}`;
 	}
 
 	private async saveLinearSessionQueue(): Promise<void> {
+		const save = this.linearSessionQueueSavePromise.then(() =>
+			this.writeLinearSessionQueueSnapshot(),
+		);
+		this.linearSessionQueueSavePromise = save.catch(() => undefined);
+		await save;
+	}
+
+	private async writeLinearSessionQueueSnapshot(): Promise<void> {
 		const items: SerializedAgentSessionQueueItem[] = [
 			...Array.from(this.linearSessionActiveItems.values()).map((item) => ({
 				...item,
@@ -8634,7 +8785,9 @@ ${taskSection}`;
 		];
 
 		await mkdir(this.cyrusHome, { recursive: true });
-		const tempPath = `${this.linearSessionQueueFile}.tmp`;
+		const tempPath = `${this.linearSessionQueueFile}.${process.pid}.${Date.now()}.${Math.random()
+			.toString(36)
+			.slice(2)}.tmp`;
 		await writeFile(
 			tempPath,
 			JSON.stringify(
