@@ -1164,7 +1164,7 @@ export class EdgeWorker extends EventEmitter {
 		});
 
 		fastify.post("/agent-queue/gc", async (request, reply) => {
-			if (!this.isLoopbackRequestAddress(request.ip)) {
+			if (!this.isLocalAdminRequest(request)) {
 				return reply.status(403).send({
 					ok: false,
 					error:
@@ -1252,6 +1252,48 @@ export class EdgeWorker extends EventEmitter {
 		this.logger.info("   Route: POST /agent-queue/gc");
 		this.logger.info("   Route: POST /agent-queue/github-conflict-rebase/scan");
 		this.logger.info("   Route: POST /agent-queue/:sessionId/prioritize");
+	}
+
+	private isLocalAdminRequest(request: {
+		ip?: string;
+		headers?: Record<string, string | string[] | undefined>;
+	}): boolean {
+		const adminToken = process.env.CYRUS_ADMIN_TOKEN?.trim();
+		if (adminToken) {
+			const token = this.getSingleHeaderValue(
+				request.headers?.["x-cyrus-admin-token"],
+			);
+			if (token === adminToken) {
+				return true;
+			}
+
+			const authorization = this.getSingleHeaderValue(
+				request.headers?.authorization,
+			);
+			if (authorization === `Bearer ${adminToken}`) {
+				return true;
+			}
+		}
+
+		if (!this.isLoopbackRequestAddress(request.ip)) {
+			return false;
+		}
+
+		const host = this.getSingleHeaderValue(request.headers?.host)
+			.toLowerCase()
+			.trim();
+		return (
+			host.startsWith("127.0.0.1:") ||
+			host === "127.0.0.1" ||
+			host.startsWith("localhost:") ||
+			host === "localhost" ||
+			host.startsWith("[::1]:") ||
+			host === "[::1]"
+		);
+	}
+
+	private getSingleHeaderValue(header: string | string[] | undefined): string {
+		return Array.isArray(header) ? (header[0] ?? "") : (header ?? "");
 	}
 
 	private isLoopbackRequestAddress(address: string | undefined): boolean {

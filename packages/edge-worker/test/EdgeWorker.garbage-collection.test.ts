@@ -100,6 +100,7 @@ describe("EdgeWorker - garbage collection", () => {
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
+		vi.unstubAllEnvs();
 		if (edgeWorker) {
 			await edgeWorker.stop().catch(() => undefined);
 		}
@@ -249,5 +250,30 @@ describe("EdgeWorker - garbage collection", () => {
 		expect(
 			readdirSync(root).filter((name) => name.includes(".tmp")),
 		).toHaveLength(0);
+	});
+
+	it("keeps the manual GC endpoint local or token-authenticated", () => {
+		const worker = createWorker();
+
+		expect(
+			(worker as any).isLocalAdminRequest({
+				ip: "127.0.0.1",
+				headers: { host: "cyrus.funnelcockpit.com" },
+			}),
+		).toBe(false);
+		expect(
+			(worker as any).isLocalAdminRequest({
+				ip: "127.0.0.1",
+				headers: { host: "127.0.0.1:3456" },
+			}),
+		).toBe(true);
+
+		vi.stubEnv("CYRUS_ADMIN_TOKEN", "secret-token");
+		expect(
+			(worker as any).isLocalAdminRequest({
+				ip: "203.0.113.10",
+				headers: { authorization: "Bearer secret-token" },
+			}),
+		).toBe(true);
 	});
 });
