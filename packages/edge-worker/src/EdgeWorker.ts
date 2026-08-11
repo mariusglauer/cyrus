@@ -271,9 +271,12 @@ type GarbageCollectionSummary = {
 	removedRemoteBranches: number;
 	scannedTempDirs: number;
 	removedTempDirs: number;
+	scannedSystemTempDirs: number;
+	removedSystemTempDirs: number;
 	removedSessions: number;
 	removedRegistrySessions: number;
 	removedInactiveWorktrees: number;
+	removedWorktreeCacheDirs: number;
 	skippedProtected: number;
 	skippedOpenPullRequests: number;
 	skippedUnknownPullRequests: number;
@@ -422,6 +425,13 @@ export class EdgeWorker extends EventEmitter {
 		Number.parseInt(process.env.CYRUS_GC_WORKTREE_TTL_MS || "3600000", 10) ||
 			3_600_000,
 	);
+	private readonly garbageCollectionWorktreeCacheTtlMs = Math.max(
+		3_600_000,
+		Number.parseInt(
+			process.env.CYRUS_GC_WORKTREE_CACHE_TTL_MS || "86400000",
+			10,
+		) || 86_400_000,
+	);
 	private readonly garbageCollectionDeleteRemoteBranches =
 		process.env.CYRUS_GC_DELETE_REMOTE_BRANCHES?.toLowerCase().trim() ===
 		"true";
@@ -439,6 +449,13 @@ export class EdgeWorker extends EventEmitter {
 		60_000,
 		Number.parseInt(process.env.CYRUS_GC_TEMP_TTL_MS || "3600000", 10) ||
 			3_600_000,
+	);
+	private readonly garbageCollectionSystemTempEnabled =
+		process.env.CYRUS_GC_SYSTEM_TMP_ENABLED?.toLowerCase().trim() !== "false";
+	private readonly garbageCollectionSystemTempTtlMs = Math.max(
+		3_600_000,
+		Number.parseInt(process.env.CYRUS_GC_SYSTEM_TMP_TTL_MS || "86400000", 10) ||
+			86_400_000,
 	);
 	private readonly diskGuardEnabled =
 		process.env.CYRUS_DISK_GUARD_ENABLED?.toLowerCase().trim() !== "false";
@@ -4812,10 +4829,13 @@ ${taskSection}`;
 				sessionTtlMs: this.garbageCollectionSessionTtlMs,
 				terminalPrGraceMs: this.garbageCollectionTerminalPrGraceMs,
 				worktreeTtlMs: this.garbageCollectionWorktreeTtlMs,
+				worktreeCacheTtlMs: this.garbageCollectionWorktreeCacheTtlMs,
 				deleteRemoteBranches: this.garbageCollectionDeleteRemoteBranches,
 				runWhenBusy: this.garbageCollectionRunWhenBusy,
 				maxRemovalsPerRun: this.garbageCollectionMaxRemovalsPerRun,
 				tempTtlMs: this.garbageCollectionTempTtlMs,
+				systemTempEnabled: this.garbageCollectionSystemTempEnabled,
+				systemTempTtlMs: this.garbageCollectionSystemTempTtlMs,
 				lastRun: this.lastGarbageCollectionSummary,
 			},
 			diskGuard: {
@@ -5227,9 +5247,12 @@ ${taskSection}`;
 			removedRemoteBranches: 0,
 			scannedTempDirs: 0,
 			removedTempDirs: 0,
+			scannedSystemTempDirs: 0,
+			removedSystemTempDirs: 0,
 			removedSessions: 0,
 			removedRegistrySessions: 0,
 			removedInactiveWorktrees: 0,
+			removedWorktreeCacheDirs: 0,
 			skippedProtected: 0,
 			skippedOpenPullRequests: 0,
 			skippedUnknownPullRequests: 0,
@@ -5257,6 +5280,7 @@ ${taskSection}`;
 
 			const protection = this.buildGarbageCollectionProtection();
 			await this.collectGarbageFromTempDirs(protection, summary);
+			await this.collectGarbageFromSystemTempEntries(summary);
 			await this.collectGarbageFromWorktrees(protection, summary);
 			await this.collectGarbageFromLocalBranches(protection, summary);
 
@@ -5278,12 +5302,14 @@ ${taskSection}`;
 			summary.removedLocalBranches > 0 ||
 			summary.removedRemoteBranches > 0 ||
 			summary.removedTempDirs > 0 ||
+			summary.removedSystemTempDirs > 0 ||
+			summary.removedWorktreeCacheDirs > 0 ||
 			summary.removedSessions > 0 ||
 			summary.removedRegistrySessions > 0 ||
 			summary.errors.length > 0
 		) {
 			this.logger.info(
-				`Garbage collection finished: removed ${summary.removedWorktrees} worktree(s), ${summary.removedLocalBranches} local branch(es), ${summary.removedRemoteBranches} remote branch(es), ${summary.removedTempDirs} temp dir(s), ${summary.removedSessions} persisted session(s)`,
+				`Garbage collection finished: removed ${summary.removedWorktrees} worktree(s), ${summary.removedLocalBranches} local branch(es), ${summary.removedRemoteBranches} remote branch(es), ${summary.removedTempDirs} temp dir(s), ${summary.removedSystemTempDirs} system temp entry(s), ${summary.removedWorktreeCacheDirs} worktree cache dir(s), ${summary.removedSessions} persisted session(s)`,
 			);
 		}
 	}
@@ -5387,6 +5413,65 @@ ${taskSection}`;
 				);
 			}
 		}
+	}
+
+	private async collectGarbageFromSystemTempEntries(
+		summary: GarbageCollectionSummary,
+	): Promise<void> {
+		if (!this.garbageCollectionSystemTempEnabled) {
+			return;
+		}
+
+		const tempRoot = process.env.CYRUS_GC_SYSTEM_TMP_DIR?.trim() || "/tmp";
+		if (!existsSync(tempRoot)) {
+			return;
+		}
+
+		const cutoff = Date.now() - this.garbageCollectionSystemTempTtlMs;
+		const currentUid = process.getuid?.();
+		const entries = await readdir(tempRoot, { withFileTypes: true }).catch(
+			() => [],
+		);
+		for (const entry of entries) {
+			if (!this.isCyrusSystemTempEntryName(entry.name)) {
+				continue;
+			}
+
+			summary.scannedSystemTempDirs++;
+			const tempPath = join(tempRoot, entry.name);
+			const info = await stat(tempPath).catch(() => undefined);
+			if (!info || info.mtimeMs >= cutoff) {
+				continue;
+			}
+			if (currentUid !== undefined && info.uid !== currentUid) {
+				continue;
+			}
+
+			try {
+				await rm(tempPath, { recursive: true, force: true });
+				summary.removedSystemTempDirs++;
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				summary.errors.push(
+					`Failed to remove system temp entry ${entry.name}: ${message}`,
+				);
+			}
+		}
+	}
+
+	private isCyrusSystemTempEntryName(name: string): boolean {
+		return [
+			/^pr[-\d].*/i,
+			/^fc[-\d].*/i,
+			/^funnelcockpit-pr/i,
+			/^bun(?:-|$)/i,
+			/^bunx-/i,
+			/^npm-cache/i,
+			/^node-compile-cache$/i,
+			/^codex-(?:cache|bun|tmp)/i,
+			/^cyrus-/i,
+			/^\.?[-a-f0-9]+\.node-gyp$/i,
+		].some((pattern) => pattern.test(name));
 	}
 
 	private async collectGarbageFromWorktrees(
@@ -5517,6 +5602,13 @@ ${taskSection}`;
 					summary.skippedUnknownPullRequests++;
 				}
 			} else {
+				if (blocker === "dirty") {
+					await this.collectGarbageFromWorktreeCacheDirs(
+						workspacePath,
+						branchRefs,
+						summary,
+					);
+				}
 				this.recordInactiveWorktreeRemovalBlocker(blocker, summary);
 			}
 		}
@@ -5574,6 +5666,99 @@ ${taskSection}`;
 		if (blocker === "dirty") {
 			summary.skippedDirtyWorktrees++;
 		}
+	}
+
+	private async collectGarbageFromWorktreeCacheDirs(
+		workspacePath: string,
+		branchRefs: WorktreeBranchRef[],
+		summary: GarbageCollectionSummary,
+	): Promise<void> {
+		const info = await stat(workspacePath).catch(() => undefined);
+		if (
+			!info ||
+			Date.now() - info.mtimeMs < this.garbageCollectionWorktreeCacheTtlMs
+		) {
+			return;
+		}
+
+		const candidates = this.listWorktreeCacheDirCandidates(
+			workspacePath,
+			branchRefs,
+		);
+		for (const candidate of candidates) {
+			const candidateInfo = await stat(candidate).catch(() => undefined);
+			if (!candidateInfo?.isDirectory()) {
+				continue;
+			}
+
+			try {
+				await rm(candidate, { recursive: true, force: true });
+				summary.removedWorktreeCacheDirs++;
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				summary.errors.push(
+					`Failed to remove worktree cache directory ${candidate}: ${message}`,
+				);
+			}
+		}
+	}
+
+	private listWorktreeCacheDirCandidates(
+		workspacePath: string,
+		branchRefs: WorktreeBranchRef[],
+	): string[] {
+		const roots = new Set<string>([
+			workspacePath,
+			...branchRefs.map((ref) => ref.path),
+		]);
+		const candidates = new Set<string>();
+		const addRootCaches = (root: string) => {
+			for (const name of [
+				"node_modules",
+				".next",
+				".turbo",
+				".cache",
+				"coverage",
+				"playwright-report",
+				"test-results",
+				".nyc_output",
+				".vitest",
+			]) {
+				candidates.add(join(root, name));
+			}
+			for (const containerName of ["apps", "packages"]) {
+				const container = join(root, containerName);
+				if (!existsSync(container)) {
+					continue;
+				}
+				try {
+					for (const entry of readdirSync(container, { withFileTypes: true })) {
+						if (!entry.isDirectory()) {
+							continue;
+						}
+						const child = join(container, entry.name);
+						for (const name of [
+							".next",
+							".turbo",
+							"coverage",
+							"playwright-report",
+							"test-results",
+							".vitest",
+						]) {
+							candidates.add(join(child, name));
+						}
+					}
+				} catch {
+					// Best-effort cache discovery only.
+				}
+			}
+		};
+
+		for (const root of roots) {
+			addRootCaches(root);
+		}
+
+		return Array.from(candidates);
 	}
 
 	private async collectGarbageFromLocalBranches(
