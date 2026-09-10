@@ -3494,6 +3494,49 @@ Your base branch \`${branchName}\` has received ${commitCount} new commit(s). Co
 		return pullRequest.mergeable === false || mergeableState === "dirty";
 	}
 
+	private getGitHubConflictRebaseProtectionReason(
+		pullRequest: GitHubPullRequest,
+		repository: RepositoryConfig,
+	): string | null {
+		if (/release/i.test(pullRequest.title ?? "")) {
+			return 'the pull request title contains "release"';
+		}
+
+		const headBranch = pullRequest.head?.ref?.trim();
+		if (!headBranch) {
+			return "the pull request head branch is missing";
+		}
+
+		const protectedBranches = new Set(
+			[
+				"main",
+				"master",
+				"stage",
+				"staging",
+				"develop",
+				"development",
+				"production",
+				"prod",
+				"trunk",
+				repository.baseBranch,
+				pullRequest.head.repo?.default_branch,
+				pullRequest.base.repo?.default_branch,
+			]
+				.filter((branch): branch is string => Boolean(branch?.trim()))
+				.map((branch) => branch.trim().toLowerCase()),
+		);
+		const normalizedHeadBranch = headBranch.toLowerCase();
+		if (protectedBranches.has(normalizedHeadBranch)) {
+			return `the head branch \`${headBranch}\` is protected`;
+		}
+
+		if (/(^|[/_-])releases?([/_-]|$)/i.test(headBranch)) {
+			return `the head branch \`${headBranch}\` is a release branch`;
+		}
+
+		return null;
+	}
+
 	private canAutoRebaseGitHubPullRequestHead(
 		pullRequest: GitHubPullRequest,
 		repository: RepositoryConfig,
@@ -3544,6 +3587,17 @@ Your base branch \`${branchName}\` has received ${commitCount} new commit(s). Co
 		if (this.isGitHubPullRequestTerminal(pullRequest)) {
 			this.logger.debug(
 				`Ignoring conflict rebase for terminal PR ${workItemIdentifier}`,
+			);
+			return;
+		}
+
+		const protectionReason = this.getGitHubConflictRebaseProtectionReason(
+			pullRequest,
+			repository,
+		);
+		if (protectionReason) {
+			this.logger.info(
+				`Ignoring conflict rebase for ${workItemIdentifier} because ${protectionReason}`,
 			);
 			return;
 		}
@@ -8328,6 +8382,17 @@ ${taskSection}`;
 		const pullRequest =
 			(await this.fetchGitHubPullRequestDetails(event)) ??
 			event.payload.pull_request;
+		const protectionReason = this.getGitHubConflictRebaseProtectionReason(
+			pullRequest,
+			repository,
+		);
+		if (protectionReason) {
+			this.logger.info(
+				`Skipping queued conflict rebase for ${this.getGitHubPullRequestWorkItemIdentifier(event)} because ${protectionReason}`,
+			);
+			return;
+		}
+
 		if (!this.isGitHubPullRequestMergeConflict(pullRequest)) {
 			await this.postGitHubPullRequestIssueComment(
 				event,

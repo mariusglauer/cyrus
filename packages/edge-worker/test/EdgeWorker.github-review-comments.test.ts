@@ -368,6 +368,106 @@ describe("EdgeWorker - GitHub review comments", () => {
 		expect((edgeWorker as any).drainLinearSessionQueue).toHaveBeenCalled();
 	});
 
+	it("does not queue conflicted release pull requests", async () => {
+		(edgeWorker as any).config.githubConflictRebaseTrigger = true;
+		(edgeWorker as any).config.githubConflictRebaseIncludeExternalAuthors =
+			true;
+		const pullRequest = conflictedPullRequest({
+			title: "Release stage to master",
+			head: {
+				label: "acme:feature/release-preparation",
+				ref: "feature/release-preparation",
+				sha: "abcdef1234567890",
+				repo: repositoryRef,
+			},
+		});
+		stubConflictRebaseSideEffects(pullRequest);
+
+		await (edgeWorker as any).enqueueGitHubConflictRebaseIfNeeded(
+			pullRequestEvent(pullRequest),
+			mockRepository,
+			"pull_request",
+		);
+
+		expect(
+			(edgeWorker as any).postGitHubPullRequestIssueComment,
+		).not.toHaveBeenCalled();
+		expect((edgeWorker as any).linearSessionQueue).toHaveLength(0);
+	});
+
+	it("protects default, integration, production, and release head branches", () => {
+		const protectedBranches = [
+			"main",
+			"master",
+			"stage",
+			"staging",
+			"develop",
+			"development",
+			"production",
+			"prod",
+			"trunk",
+			"release",
+			"release/2026-09",
+		];
+
+		for (const branch of protectedBranches) {
+			const pullRequest = conflictedPullRequest({
+				head: {
+					label: `acme:${branch}`,
+					ref: branch,
+					sha: "abcdef1234567890",
+					repo: repositoryRef,
+				},
+			});
+
+			expect(
+				(edgeWorker as any).getGitHubConflictRebaseProtectionReason(
+					pullRequest,
+					mockRepository,
+				),
+			).not.toBeNull();
+		}
+
+		const configuredDefaultBranchPullRequest = conflictedPullRequest({
+			head: {
+				label: "acme:integration",
+				ref: "integration",
+				sha: "abcdef1234567890",
+				repo: repositoryRef,
+			},
+		});
+		expect(
+			(edgeWorker as any).getGitHubConflictRebaseProtectionReason(
+				configuredDefaultBranchPullRequest,
+				{ ...mockRepository, baseBranch: "integration" },
+			),
+		).not.toBeNull();
+	});
+
+	it("rechecks release protection before a queued rebase starts", async () => {
+		const pullRequest = conflictedPullRequest({
+			title: "Release September",
+		});
+		(edgeWorker as any).fetchGitHubPullRequestDetails = vi
+			.fn()
+			.mockResolvedValue(pullRequest);
+		(edgeWorker as any).createGitHubWorkspace = vi.fn();
+
+		await (edgeWorker as any).runQueuedGitHubConflictRebaseSession({
+			origin: "github",
+			task: "github-conflict-rebase",
+			githubPullRequestEvent: pullRequestEvent(pullRequest),
+			githubRepositoryId: mockRepository.id,
+			workItemIdentifier: "acme/web#12",
+			sessionId: "github-conflict-rebase-acme-web-12-abcdef123456",
+			queuedAt: Date.now(),
+			availableAt: Date.now(),
+			retryCount: 0,
+		});
+
+		expect((edgeWorker as any).createGitHubWorkspace).not.toHaveBeenCalled();
+	});
+
 	it("scans open PRs for conflicts when a configured base branch receives a push", async () => {
 		(edgeWorker as any).config.githubConflictRebaseTrigger = true;
 		(edgeWorker as any).config.githubConflictRebaseIncludeExternalAuthors =
