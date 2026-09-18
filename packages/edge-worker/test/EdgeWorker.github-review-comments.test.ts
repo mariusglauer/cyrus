@@ -368,6 +368,93 @@ describe("EdgeWorker - GitHub review comments", () => {
 		expect((edgeWorker as any).drainLinearSessionQueue).toHaveBeenCalled();
 	});
 
+	it("deduplicates concurrent conflict rebase enqueue attempts", async () => {
+		(edgeWorker as any).config.githubConflictRebaseTrigger = true;
+		(edgeWorker as any).config.githubConflictRebaseIncludeExternalAuthors =
+			true;
+		const pullRequest = conflictedPullRequest();
+		stubConflictRebaseSideEffects(pullRequest);
+
+		await Promise.all([
+			(edgeWorker as any).enqueueGitHubConflictRebaseIfNeeded(
+				pullRequestEvent(pullRequest),
+				mockRepository,
+				"base_branch_push",
+			),
+			(edgeWorker as any).enqueueGitHubConflictRebaseIfNeeded(
+				pullRequestEvent(pullRequest),
+				mockRepository,
+				"base_branch_push",
+			),
+		]);
+
+		expect((edgeWorker as any).linearSessionQueue).toHaveLength(1);
+		expect(
+			(edgeWorker as any).postGitHubPullRequestIssueComment,
+		).toHaveBeenCalledTimes(1);
+	});
+
+	it("rejects a conflict rebase runner error result", () => {
+		const runner = {
+			getMessages: vi.fn().mockReturnValue([
+				{
+					type: "result",
+					subtype: "error_during_execution",
+					is_error: true,
+					errors: ["Codex credits are exhausted"],
+				},
+			]),
+		};
+
+		expect(() =>
+			(edgeWorker as any).assertGitHubConflictRebaseRunnerSucceeded(
+				runner,
+				"acme/web#12",
+			),
+		).toThrow("Codex credits are exhausted");
+	});
+
+	it("verifies that a conflict rebase changed the remote head and resolved conflicts", async () => {
+		const resolvedPullRequest = conflictedPullRequest({
+			head: {
+				label: "acme:feature/fc-4172-checkout",
+				ref: "feature/fc-4172-checkout",
+				sha: "fedcba9876543210",
+				repo: repositoryRef,
+			},
+			mergeable: true,
+			mergeable_state: "clean",
+		});
+		(edgeWorker as any).fetchGitHubPullRequestDetails = vi
+			.fn()
+			.mockResolvedValue(resolvedPullRequest);
+
+		await expect(
+			(edgeWorker as any).verifyGitHubConflictRebaseResult(
+				pullRequestEvent(resolvedPullRequest),
+				"abcdef1234567890",
+				1,
+				0,
+			),
+		).resolves.toEqual(resolvedPullRequest);
+	});
+
+	it("rejects a conflict rebase that did not update GitHub", async () => {
+		const pullRequest = conflictedPullRequest();
+		(edgeWorker as any).fetchGitHubPullRequestDetails = vi
+			.fn()
+			.mockResolvedValue(pullRequest);
+
+		await expect(
+			(edgeWorker as any).verifyGitHubConflictRebaseResult(
+				pullRequestEvent(pullRequest),
+				pullRequest.head.sha,
+				1,
+				0,
+			),
+		).rejects.toThrow("did not update the remote head SHA");
+	});
+
 	it("does not queue conflicted release pull requests", async () => {
 		(edgeWorker as any).config.githubConflictRebaseTrigger = true;
 		(edgeWorker as any).config.githubConflictRebaseIncludeExternalAuthors =
@@ -447,6 +534,32 @@ describe("EdgeWorker - GitHub review comments", () => {
 	it("rechecks release protection before a queued rebase starts", async () => {
 		const pullRequest = conflictedPullRequest({
 			title: "Release September",
+		});
+		(edgeWorker as any).fetchGitHubPullRequestDetails = vi
+			.fn()
+			.mockResolvedValue(pullRequest);
+		(edgeWorker as any).createGitHubWorkspace = vi.fn();
+
+		await (edgeWorker as any).runQueuedGitHubConflictRebaseSession({
+			origin: "github",
+			task: "github-conflict-rebase",
+			githubPullRequestEvent: pullRequestEvent(pullRequest),
+			githubRepositoryId: mockRepository.id,
+			workItemIdentifier: "acme/web#12",
+			sessionId: "github-conflict-rebase-acme-web-12-abcdef123456",
+			queuedAt: Date.now(),
+			availableAt: Date.now(),
+			retryCount: 0,
+		});
+
+		expect((edgeWorker as any).createGitHubWorkspace).not.toHaveBeenCalled();
+	});
+
+	it("does not start a queued rebase after the pull request was merged", async () => {
+		const pullRequest = conflictedPullRequest({
+			state: "closed",
+			merged: true,
+			merged_at: "2026-09-19T00:00:00Z",
 		});
 		(edgeWorker as any).fetchGitHubPullRequestDetails = vi
 			.fn()

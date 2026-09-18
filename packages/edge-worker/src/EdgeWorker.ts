@@ -3635,21 +3635,23 @@ Your base branch \`${branchName}\` has received ${commitCount} new commit(s). Co
 		const sessionId = this.getGitHubConflictRebaseSessionId(event, pullRequest);
 		if (
 			this.linearSessionActiveItems.has(sessionId) ||
-			this.linearSessionQueue.some((item) => item.sessionId === sessionId)
+			Array.from(this.linearSessionActiveItems.values()).some(
+				(item) =>
+					item.task === "github-conflict-rebase" &&
+					item.workItemIdentifier === workItemIdentifier,
+			) ||
+			this.linearSessionQueue.some(
+				(item) =>
+					item.sessionId === sessionId ||
+					(item.task === "github-conflict-rebase" &&
+						item.workItemIdentifier === workItemIdentifier),
+			)
 		) {
 			this.logger.info(
 				`Skipping duplicate GitHub conflict rebase queue item for ${workItemIdentifier}`,
 			);
 			return;
 		}
-
-		const body = `Cyrus detected merge conflicts between \`${pullRequest.head.ref}\` and \`${pullRequest.base.ref}\`. I am queueing an automatic rebase now and will push the rebased branch if the conflicts can be resolved safely.`;
-		await this.postGitHubPullRequestIssueComment(event, body);
-		await this.postGitHubLinkedLinearThoughtForPullRequestEvent(
-			event,
-			repository,
-			body,
-		);
 
 		const now = Date.now();
 		const item: AgentSessionQueueItem = {
@@ -3676,6 +3678,14 @@ Your base branch \`${branchName}\` has received ${commitCount} new commit(s). Co
 			`Queued GitHub conflict rebase for ${workItemIdentifier} (${trigger})`,
 		);
 		this.drainLinearSessionQueue();
+
+		const body = `Cyrus detected merge conflicts between \`${pullRequest.head.ref}\` and \`${pullRequest.base.ref}\`. I am queueing an automatic rebase now and will push the rebased branch if the conflicts can be resolved safely.`;
+		await this.postGitHubPullRequestIssueComment(event, body);
+		await this.postGitHubLinkedLinearThoughtForPullRequestEvent(
+			event,
+			repository,
+			body,
+		);
 	}
 
 	private getGitHubConflictRebaseSessionId(
@@ -3695,6 +3705,151 @@ Your base branch \`${branchName}\` has received ${commitCount} new commit(s). Co
 	): string {
 		const prNumber = extractPRNumber(event);
 		return `${extractRepoFullName(event)}#${prNumber ?? "unknown"}`;
+	}
+
+	private prepareGitHubConflictRebaseWorkspace(
+		workspacePath: string,
+		pullRequest: GitHubPullRequest,
+	): void {
+		const branchRef = pullRequest.head.ref.trim();
+		const baseBranchRef = pullRequest.base.ref.trim();
+		const expectedHeadSha = pullRequest.head.sha.trim();
+		const commandOptions = {
+			cwd: workspacePath,
+			encoding: "utf8" as const,
+		};
+		const status = execFileSync(
+			"git",
+			["status", "--porcelain"],
+			commandOptions,
+		).trim();
+		if (status) {
+			throw new Error(
+				`Conflict rebase workspace ${workspacePath} has uncommitted changes; refusing to replace them`,
+			);
+		}
+
+		execFileSync(
+			"git",
+			[
+				"fetch",
+				"origin",
+				`+refs/heads/${branchRef}:refs/remotes/origin/${branchRef}`,
+				`+refs/heads/${baseBranchRef}:refs/remotes/origin/${baseBranchRef}`,
+			],
+			commandOptions,
+		);
+
+		const currentBranch = execFileSync(
+			"git",
+			["branch", "--show-current"],
+			commandOptions,
+		).trim();
+		if (currentBranch !== branchRef) {
+			throw new Error(
+				`Conflict rebase workspace ${workspacePath} is on \`${currentBranch || "detached HEAD"}\`, expected \`${branchRef}\``,
+			);
+		}
+
+		const remoteHeadRef = `refs/remotes/origin/${branchRef}`;
+		const remoteHeadSha = execFileSync(
+			"git",
+			["rev-parse", remoteHeadRef],
+			commandOptions,
+		).trim();
+		if (remoteHeadSha !== expectedHeadSha) {
+			throw new Error(
+				`GitHub reported ${expectedHeadSha} for \`${branchRef}\`, but origin currently points to ${remoteHeadSha}`,
+			);
+		}
+
+		execFileSync("git", ["reset", "--hard", remoteHeadSha], commandOptions);
+		execFileSync(
+			"git",
+			["branch", "--set-upstream-to", `origin/${branchRef}`, branchRef],
+			commandOptions,
+		);
+
+		const preparedHeadSha = execFileSync(
+			"git",
+			["rev-parse", "HEAD"],
+			commandOptions,
+		).trim();
+		if (preparedHeadSha !== expectedHeadSha) {
+			throw new Error(
+				`Failed to prepare conflict rebase workspace at ${expectedHeadSha}; HEAD is ${preparedHeadSha}`,
+			);
+		}
+	}
+
+	private assertGitHubConflictRebaseRunnerSucceeded(
+		runner: IAgentRunner,
+		workItemIdentifier: string,
+	): void {
+		const result = [...runner.getMessages()]
+			.reverse()
+			.find((message) => message.type === "result") as
+			| {
+					subtype?: string;
+					is_error?: boolean;
+					errors?: string[];
+			  }
+			| undefined;
+
+		if (result?.subtype === "success" && result.is_error !== true) {
+			return;
+		}
+
+		const details = result?.errors?.filter(Boolean).join("; ");
+		throw new Error(
+			`GitHub conflict rebase runner failed for ${workItemIdentifier}: ${details || "runner returned no successful terminal result"}`,
+		);
+	}
+
+	private async verifyGitHubConflictRebaseResult(
+		event: GitHubPullRequestWebhookEvent,
+		previousHeadSha: string,
+		maxAttempts = 6,
+		delayMs = 2_000,
+	): Promise<GitHubPullRequest> {
+		let latestPullRequest: GitHubPullRequest | null = null;
+
+		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+			latestPullRequest = await this.fetchGitHubPullRequestDetails(event);
+			if (latestPullRequest) {
+				if (this.isGitHubPullRequestTerminal(latestPullRequest)) {
+					return latestPullRequest;
+				}
+				if (
+					latestPullRequest.head.sha !== previousHeadSha &&
+					latestPullRequest.mergeable === true &&
+					!this.isGitHubPullRequestMergeConflict(latestPullRequest)
+				) {
+					return latestPullRequest;
+				}
+			}
+
+			if (attempt < maxAttempts && delayMs > 0) {
+				await new Promise((resolve) => setTimeout(resolve, delayMs));
+			}
+		}
+
+		if (!latestPullRequest) {
+			throw new Error("GitHub did not return the PR after the conflict rebase");
+		}
+		if (latestPullRequest.head.sha === previousHeadSha) {
+			throw new Error(
+				`Conflict rebase did not update the remote head SHA from ${previousHeadSha}`,
+			);
+		}
+		if (latestPullRequest.mergeable == null) {
+			throw new Error(
+				"GitHub did not finish computing mergeability after the conflict rebase",
+			);
+		}
+		throw new Error(
+			`GitHub still reports merge conflicts after the rebase (${latestPullRequest.mergeable_state ?? "unknown"})`,
+		);
 	}
 
 	private async postGitHubPullRequestIssueComment(
@@ -8382,6 +8537,12 @@ ${taskSection}`;
 		const pullRequest =
 			(await this.fetchGitHubPullRequestDetails(event)) ??
 			event.payload.pull_request;
+		if (this.isGitHubPullRequestTerminal(pullRequest)) {
+			this.logger.info(
+				`Skipping queued conflict rebase for ${this.getGitHubPullRequestWorkItemIdentifier(event)} because the pull request is already merged or closed`,
+			);
+			return;
+		}
 		const protectionReason = this.getGitHubConflictRebaseProtectionReason(
 			pullRequest,
 			repository,
@@ -8416,6 +8577,7 @@ ${taskSection}`;
 				`Failed to create workspace for ${repoFullName}#${prNumber}`,
 			);
 		}
+		this.prepareGitHubConflictRebaseWorkspace(workspace.path, pullRequest);
 
 		const issueMinimal: IssueMinimal = {
 			id: `github-conflict-rebase-${repoFullName}#${prNumber}`,
@@ -8503,11 +8665,35 @@ ${taskSection}`;
 
 		try {
 			await runner.start(taskInstructions);
+			this.assertGitHubConflictRebaseRunnerSucceeded(
+				runner,
+				`${repoFullName}#${prNumber}`,
+			);
+			const verifiedPullRequest = await this.verifyGitHubConflictRebaseResult(
+				event,
+				pullRequest.head.sha,
+			);
+			if (this.isGitHubPullRequestTerminal(verifiedPullRequest)) {
+				this.logger.info(
+					`GitHub conflict rebase ended without a completion comment because ${repoFullName}#${prNumber} was merged or closed during the run`,
+				);
+				if (linearSessionLink) {
+					await this.activityPoster.postThoughtActivity(
+						linearSessionLink.sessionId,
+						linearSessionLink.workspaceId,
+						`GitHub conflict rebase stopped for ${repoFullName}#${prNumber} because the PR was merged or closed during the run.`,
+					);
+				}
+				return;
+			}
 			const summary = this.extractRunnerSummary(
 				runner,
 				"Conflict rebase completed. Please review the updated branch.",
 			);
 			await this.postGitHubPullRequestIssueComment(event, summary);
+			this.logger.info(
+				`Verified GitHub conflict rebase for ${repoFullName}#${prNumber} at ${verifiedPullRequest.head.sha}`,
+			);
 			if (linearSessionLink) {
 				await this.activityPoster.postThoughtActivity(
 					linearSessionLink.sessionId,
