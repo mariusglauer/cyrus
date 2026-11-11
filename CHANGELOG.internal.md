@@ -4,7 +4,73 @@ This changelog documents internal development changes, refactors, tooling update
 
 ## [Unreleased]
 
+## [0.2.76] - 2026-11-06
+
+### Changed
+- Recorded release verification for all 18 packages, including authenticated Claude tool execution, session continuity, and the pre-warmed manual-permission path. ([CYPACK-1624](https://linear.app/ceedar/issue/CYPACK-1624/run-a-release), [#1584](https://github.com/cyrusagents/cyrus/pull/1584))
+- Added installed-package and warm-session permission-contract coverage plus a retained [compatibility and acceptance record](apps/f1/test-drives/2026-11-05-cypack-1623-anthropic-sdk-acceptance.md) for the Anthropic SDK update. Cold and opt-in warm sessions now explicitly retain Cyrus's manual permission mode even when loaded settings request `auto` or `acceptEdits`. The runtime receipt binds the reviewed source, packed and installed artifacts, exact SDK/native versions, and intended Claude identity before requiring ordered successful Read and Bash results; it also rejects post-result session write loss. ([CYPACK-1623](https://linear.app/ceedar/issue/CYPACK-1623/update-anthropic-aiclaude-agent-sdk-and-anthropic-aisdk-to-the-latest), [#1583](https://github.com/cyrusagents/cyrus/pull/1583))
+
+## [0.2.75] - 2026-11-03
+
+### Changed
+- Recorded release verification for the combined v0.2.74 and v0.2.75 payload; v0.2.74 passed its dry run but was never published, so its changes first ship in v0.2.75. ([CYPACK-1618](https://linear.app/ceedar/issue/CYPACK-1618/run-a-release), [#1579](https://github.com/cyrusagents/cyrus/pull/1579))
+
+## [0.2.74] - 2026-10-21
+
+### Added
+- Documented native Codex command exceptions and the distinction between runner sandbox modes, egress-proxy settings, and writable directories. ([#1521](https://github.com/cyrusagents/cyrus/pull/1521))
+
+### Changed
+- Recorded release coverage for Codex issue sessions, sandbox mode selection, writable-root enforcement on an isolated host, and inbox publication transport. ([CYPACK-1592](https://linear.app/ceedar/issue/CYPACK-1592/run-a-release), [#1548](https://github.com/cyrusagents/cyrus/pull/1548), [#1551](https://github.com/cyrusagents/cyrus/pull/1551))
+
+## [0.2.73] - 2026-09-29
+
+### Changed
+- Added an explicit npm test-channel mode to the main-only trusted CLI release workflow: immutable candidate provenance, unprivileged build/install jobs, inspected 17-package OIDC publication with lifecycle scripts disabled, exact registry recovery/integrity checks and unchanged stable tags. ([CYPACK-1502](https://linear.app/ceedar/issue/CYPACK-1502), [#1502](https://github.com/cyrusagents/cyrus/pull/1502))
+- Switched builds, type checking, and development watch commands to the native TypeScript compiler, reducing measured local build time by 74% and type-check time by 68%. Prompt-assembly tests now use mock Linear trackers reliably, preventing network-dependent CI timeouts. ([CYPACK-1520](https://linear.app/ceedar/issue/CYPACK-1520), [#1485](https://github.com/cyrusagents/cyrus/pull/1485))
+
+### Fixed
+- Agent validation now follows changed behavior and risk, avoiding unrelated F1 drives and unnecessary automated tests on routine release, documentation, and infrastructure changes. Nonfunctional releases can supply reviewed payload-bound verification while functional releases retain relevant F1 coverage. ([CYPACK-1537](https://linear.app/ceedar/issue/CYPACK-1537), [#1503](https://github.com/cyrusagents/cyrus/pull/1503))
+- Release recovery now compares complete uncompressed package archives, retaining mixed-commit protection while allowing an approved first publish packed by a different gzip implementation to resume safely. ([#1483](https://github.com/cyrusagents/cyrus/pull/1483))
+- The release workflow now submits fresh packages in dependency order before checking npm visibility and archive integrity as a batch, avoiding registry propagation delays being multiplied across the package graph while retaining the pre-tag verification boundary. ([CYPACK-1521](https://linear.app/ceedar/issue/CYPACK-1521), [#1486](https://github.com/cyrusagents/cyrus/pull/1486))
+
+## [0.2.72] - 2026-09-15
+
 _No internal-only changes._
+
+## [0.2.71] - 2026-09-04
+
+### Changed
+- Recorded, after the fact, why #1426 removed the `linear_agent_session_create` and `linear_agent_session_create_on_comment` cyrus-tools: they allowed concurrent child sessions to be started on the same issue. That removal also silently dropped the only runtime caller of `GlobalSessionRegistry.setParentSession`, breaking parent resumption. `EdgeWorker.linkChildSessionToParentIssueSession` now derives the child-to-parent session link from Linear's issue hierarchy on `AgentSessionEvent/created` (and after repository selection), so the removed tools stay removed. ([#1454](https://github.com/cyrusagents/cyrus/pull/1454))
+
+### Fixed
+- The release workflow's npm registry visibility check now waits up to 10 minutes per package instead of 60 seconds. The v0.2.70 release run aborted mid-graph because npm's publish processing exceeded the old 12×5s window even though the publish itself succeeded; the new deadline matches npm's own "may take a few minutes" guidance. ([CYPACK-1478](https://linear.app/ceedar/issue/CYPACK-1478/if-a-mcp-server-has-no-enabled-tools-will-it-not-be-allowed-as-an-mcp), [#1442](https://github.com/cyrusagents/cyrus/pull/1442))
+
+## [0.2.70] - 2026-08-27
+
+### Added
+- Guardrails against silently dropped `EdgeConfig` fields (the CYPACK-1478 / CYHOST-967 bug class): `WorkerService.startEdgeWorker` now spreads the entire file config so pass-through fields forward automatically, `ConfigManager`'s hot-reload merge and global-change watch are driven by a single `RELOAD_MERGED_KEYS` list with a compile-time exhaustiveness check that names any unclassified schema key, and a schema-complete CLI test asserts every `EdgeConfig` field survives into the `EdgeWorkerConfig`. ([CYPACK-1478](https://linear.app/ceedar/issue/CYPACK-1478/if-a-mcp-server-has-no-enabled-tools-will-it-not-be-allowed-as-an-mcp), [#1440](https://github.com/cyrusagents/cyrus/pull/1440))
+
+### Fixed
+- Release workflows now preflight npm package existence before running release work, with actionable first-publish and trusted-publisher guidance for newly added packages ([#1436](https://github.com/cyrusagents/cyrus/pull/1436)).
+
+## [0.2.69] - 2026-08-26
+
+### Fixed
+- Removed obsolete synthetic `fallback_credit` usage fields so all runner packages build against the current shared SDK types. ([#1428](https://github.com/cyrusagents/cyrus/pull/1428))
+
+## [0.2.68] - 2026-08-05
+
+### Added
+- Added an on-demand, main-only Cyrus CLI release workflow using npm trusted publishing. It validates the coordinated monorepo version and changelogs, runs release gates, inspects every package tarball, publishes the complete dependency graph in order, and creates the matching git tag and GitHub release without a long-lived npm token. ([#1398](https://github.com/cyrusagents/cyrus/pull/1398))
+
+### Fixed
+- Made CLI releases safely resumable after a partial npm publish and tolerant of short registry visibility delays, while still rejecting existing versions that do not carry the requested distribution tag or whose published tarballs differ from the recovery run. CI now tests supported Node.js 22 and 24 releases, and CI/release actions run on their current Node.js 24-based majors. ([#1401](https://github.com/cyrusagents/cyrus/pull/1401))
+
+## [0.2.67] - 2026-07-25
+
+### Added
+- F1 release smoke validating the v0.2.67 release branch can start the F1 server, create an issue, start a Gemini-backed session, render/paginate activities, and stop cleanly before publishing. ([CYPACK-1404](https://linear.app/ceedar/issue/CYPACK-1404/run-a-release), [#1386](https://github.com/cyrusagents/cyrus/pull/1386))
 
 ## [0.2.66] - 2026-06-19
 

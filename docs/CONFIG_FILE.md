@@ -50,6 +50,147 @@ Expected file format:
 
 Learn more about MCP: https://code.claude.com/docs/en/mcp
 
+### `opencode` (object)
+
+OpenCode sessions run with Cyrus-managed inline runtime config for generated MCP servers and permission rules. By default, Cyrus otherwise inherits the parent process environment for CLI config, state, and cache paths, matching the behavior of other agent providers and allowing tools such as `gh` and `glab` to use your normal terminal authentication. You can opt into dedicated Cyrus-managed OpenCode state globally or per repository with `opencode.stateScope`.
+
+Use `opencode.config` when an OpenCode session needs OpenCode-native runtime configuration such as plugins, instructions, formatters, providers, themes, or other OpenCode config keys. It can be configured globally or per repository.
+
+Cyrus does not automatically import your existing global OpenCode config or plugin list into agent sessions. Copy only the OpenCode-native settings you want Cyrus sessions to use into `opencode.config`; Cyrus then merges those explicit settings with its generated MCP and permission rules.
+
+Use `opencode.stateScope` to control how OpenCode-launched CLI tools store config/state/cache:
+
+- `inherit` (default): do not override `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`, or `OPENCODE_CONFIG_DIR`; CLI tools inherit the same storage your Cyrus process has.
+- `shared`: use one dedicated Cyrus OpenCode state root for all OpenCode sessions: `~/.cyrus/opencode-state/shared/`.
+- `repository`: use one dedicated Cyrus OpenCode state root per configured repository: `~/.cyrus/opencode-state/repositories/<repository-id>/`.
+
+`repository` settings override global settings. Cyrus always keeps `OPENCODE_CONFIG_CONTENT` for generated MCP and permission rules regardless of state scope.
+
+**Global OpenCode config example:**
+
+```json
+{
+  "opencode": {
+    "stateScope": "inherit",
+    "config": {
+      "plugin": ["opencode-wakatime"],
+      "instructions": ["~/.config/opencode/CYRUS.md"],
+      "share": "disabled"
+    }
+  },
+  "repositories": [
+    {
+      "id": "main-app",
+      "name": "Main Application",
+      "repositoryPath": "/path/to/repo"
+    }
+  ]
+}
+```
+
+**Repository OpenCode config example:**
+
+```json
+{
+  "repositories": [
+    {
+      "id": "main-app",
+      "name": "Main Application",
+      "repositoryPath": "/path/to/repo",
+      "opencode": {
+        "stateScope": "repository",
+        "config": {
+          "plugin": ["@company/opencode-repo-plugin"],
+          "instructions": ["OPENCODE.md"],
+          "formatter": true
+        }
+      }
+    }
+  ]
+}
+```
+
+Within the Cyrus-generated inline OpenCode config, values are merged in this order:
+
+1. Global `opencode.config`
+2. Repository `opencode.config`
+3. Cyrus-generated MCP configuration
+4. Cyrus-generated permission configuration
+
+Merge behavior:
+
+- Objects deep-merge.
+- Arrays replace earlier arrays instead of concatenating.
+- Repository values override global values for the same non-object key.
+- Cyrus-generated MCP servers win over user-provided MCP servers with the same name.
+- Cyrus-generated permissions replace user-provided OpenCode permissions because they are Cyrus safety controls.
+
+This describes Cyrus's inline config merge order, not OpenCode's complete config-loading precedence. OpenCode applies Cyrus's inline config after project config, so the managed inline config can still override OpenCode settings that were loaded earlier.
+
+This explicit merge path is intentional: it keeps Cyrus-launched OpenCode sessions predictable and reviewable while still allowing opt-in OpenCode plugins, instructions, and provider/runtime settings.
+
+For MCP servers that should work across runners, prefer `mcpConfigPath`. Cyrus reads those MCP server definitions and translates them for Claude, OpenCode, and other supported runners. Use `opencode.config` for OpenCode-native runtime config that only applies to OpenCode.
+
+**OpenCode MCP OAuth authentication:**
+
+Some OpenCode MCP servers require an interactive OAuth setup step, such as:
+
+```bash
+opencode mcp auth sentry
+```
+
+Cyrus leaves OpenCode's data home unchanged, so OAuth credentials created by the OpenCode CLI remain available to Cyrus-launched OpenCode sessions. The MCP server name must match between the authentication command and the Cyrus config.
+
+If the MCP server is only defined in Cyrus `opencode.config` and not in your normal global OpenCode config, create a temporary OpenCode config file with the same server definition and authenticate through it:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "sentry": {
+      "type": "remote",
+      "url": "https://mcp.sentry.dev/mcp",
+      "oauth": {}
+    }
+  }
+}
+```
+
+Then run:
+
+```bash
+OPENCODE_CONFIG=/path/to/opencode-auth-config.json opencode mcp auth sentry
+```
+
+After authentication, keep the same MCP server name (`sentry` in this example) in Cyrus `opencode.config.mcp` or `mcpConfigPath`. OpenCode stores the OAuth credentials in its data home, while Cyrus supplies the runtime MCP config for agent sessions.
+
+**Authenticating other CLI tools for OpenCode sessions:**
+
+With the default `opencode.stateScope: "inherit"`, OpenCode-launched tools use the same CLI auth storage as the Cyrus process, so authenticate them normally before starting Cyrus, for example:
+
+```bash
+glab auth login
+```
+
+If you set `opencode.stateScope` to `shared` or `repository`, CLIs that store auth under XDG paths, such as `glab`, will use the dedicated Cyrus root instead. To pre-authenticate one of these tools exactly where the agent will look, run the CLI with the matching environment shape.
+
+For `shared`:
+
+```bash
+CYRUS_HOME="${CYRUS_HOME:-$HOME/.cyrus}"
+STATE_ROOT="$CYRUS_HOME/opencode-state/shared"
+
+mkdir -p "$STATE_ROOT/opencode-config" "$STATE_ROOT/state" "$STATE_ROOT/cache" "$STATE_ROOT/config"
+
+OPENCODE_CONFIG_DIR="$STATE_ROOT/opencode-config" \
+XDG_STATE_HOME="$STATE_ROOT/state" \
+XDG_CACHE_HOME="$STATE_ROOT/cache" \
+XDG_CONFIG_HOME="$STATE_ROOT/config" \
+glab auth login
+```
+
+For `repository`, replace `shared` with `repositories/<repository-id>`, for example `~/.cyrus/opencode-state/repositories/main-app/`. Credentials written this way persist in the configured Cyrus OpenCode state root and are available to later OpenCode sessions using the same scope.
+
 ### `teamKeys` (array of strings)
 
 Routes Linear issues from specific teams to this repository. When specified, only issues from matching teams trigger Cyrus.
@@ -69,6 +210,8 @@ Note: This is useful when you want to separate work by project rather than by te
 Routes Linear issues with specific labels to this repository. This is useful when you have multiple repositories handling issues from the same Linear team but want to route based on labels (e.g., "backend" vs "frontend" labels).
 
 Example: `["backend", "api"]` - Only process issues that have the "backend" or "api" label
+
+When the repository also sets `teamKeys`, its routing labels only match issues from those teams, so two teams can each route a label with the same name to their own repository. A repository without `teamKeys` matches its routing labels across the whole workspace.
 
 ---
 
@@ -127,13 +270,13 @@ Routes issues to different AI modes based on Linear labels and optionally config
 
 **Tool Presets:**
 
-- **`"readOnly"`**: Only tools that read/view content (17 tools)
-   - `Read`, `Glob`, `Grep`, `WebFetch`, `WebSearch`, `TaskCreate`, `TaskUpdate`, `TaskGet`, `TaskList`, `Task`, `Skill`, `ListMcpResourcesTool`, `ReadMcpResourceTool`, `Monitor`, `TaskOutput`, `EnterPlanMode`, `ExitPlanMode`
+- **`"readOnly"`**: Only tools that read/view content (14 tools)
+   - `Read`, `WebFetch`, `WebSearch`, `TaskCreate`, `TaskUpdate`, `TaskGet`, `TaskList`, `Task`, `ListAgents`, `Skill`, `Monitor`, `LSP`, `TaskOutput`, `ToolSearch`
 
-- **`"safe"`**: All tools except Bash (32 tools)
-   - All readOnly tools plus: `Edit`, `Write`, `NotebookEdit`, `AskUserQuestion`, `SendMessage`, `EnterWorktree`, `ExitWorktree`, `CronCreate`, `CronDelete`, `CronList`, `RemoteTrigger`, `ScheduleWakeup`, `TaskStop`, `TeamCreate`, `TeamDelete`
+- **`"safe"`**: All tools except Bash (30 tools)
+   - All readOnly tools plus: `Edit`, `Write`, `NotebookEdit`, `SendMessage`, `PushNotification`, `EnterWorktree`, `ExitWorktree`, `CronCreate`, `CronDelete`, `CronList`, `ScheduleWakeup`, `RemoteTrigger`, `TaskStop`, `DesignSync`, `Workflow`, `ReportFindings`
 
-- **`"all"`**: All available tools including Bash (33 tools)
+- **`"all"`**: All available tools including Bash (31 tools)
    - All safe tools plus: `Bash`
 
 - **Custom array**: Specify exact tools needed, e.g., `["Read", "Edit", "Task"]`
@@ -144,7 +287,7 @@ Note: Linear MCP tools (`mcp__linear`) are always included automatically. Slack 
 
 ## User Access Control
 
-Control which Linear users can delegate issues to Cyrus. Supports both global configuration and per-repository overrides.
+Control which users can delegate issues to Cyrus from Linear, and which can prompt it from Slack. Supports both global configuration and per-repository overrides.
 
 ### `userAccessControl` (object)
 
@@ -152,23 +295,24 @@ Can be configured at the global level or per-repository.
 
 **Properties:**
 
-- **`allowedUsers`** (array) - Users allowed to delegate issues. If specified, ONLY these users can trigger sessions. Omit to allow everyone.
+- **`allowedUsers`** (array) - Users allowed to delegate issues. If specified, only these users can trigger Linear sessions; Slack is restricted only when the list has `slackId` entries (see below). Omit to allow everyone.
 - **`blockedUsers`** (array) - Users blocked from delegating issues. Takes precedence over allowedUsers.
 - **`blockBehavior`** (string) - What happens when a blocked user tries to delegate:
   - `"silent"` (default) - Ignore the webhook quietly
   - `"comment"` - Post a message explaining the user is not authorized
 - **`blockMessage`** (string) - Custom message when blockBehavior is "comment". Supports template variables:
-  - `{{userName}}` - The user's display name
-  - `{{userId}}` - The user's Linear ID
+  - `{{userName}}` - The user's display name (on Slack, an @mention of the user)
+  - `{{userId}}` - The user's Linear or Slack ID
 
   Default: `"{{userName}}, you are not authorized to delegate issues to this agent."`
 
 **User Identifiers:**
 
-Users can be specified in three formats:
+Users can be specified in four formats:
 - String (treated as Linear user ID): `"usr_abc123"`
 - Object with ID: `{ "id": "usr_abc123" }`
 - Object with email: `{ "email": "user@example.com" }` (case-insensitive)
+- Object with Slack ID: `{ "slackId": "U012AB3CD" }` (Slack sessions only)
 
 **Example - Global configuration:**
 
@@ -208,6 +352,31 @@ Users can be specified in three formats:
 - **blockedUsers**: Repository config EXTENDS global (merged/additive)
 - **blockBehavior**: Repository config OVERRIDES global
 - **blockMessage**: Repository config OVERRIDES global
+
+### Slack sessions
+
+The same lists gate who can start or continue a Slack session, keyed by the Slack user ID on the message (`U012AB3CD`, shown under "Copy member ID" in a Slack profile):
+
+- Only `{ "slackId": ... }` entries match a Slack user. An `allowedUsers` list restricts Linear whenever it is present; it restricts Slack only when it contains Slack entries or is empty, so a Linear-only list leaves Slack open.
+- Slack sessions are not bound to a repository, so only the global `userAccessControl` applies; repository-level lists are ignored for Slack.
+- A user who fails the check cannot prompt the agent. With `"silent"` (default) nothing happens, not even the receipt reaction. With `"comment"` their @mention is answered with the block message; their thread replies are still dropped silently. Their messages remain visible to the agent as thread context, like any other message in the thread.
+- Threads Cyrus was never mentioned in are ignored either way.
+- `"comment"` suits a single worker. When several workers share one Slack app, keep the default `"silent"`, or every worker that does not list the author posts a notice.
+- Changes to the lists take effect after a restart.
+
+Several workers can share one Slack app, for example one per engineer running on their own machine. Each worker lists its owner, so only that worker answers the owner's mentions:
+
+```json
+{
+  "userAccessControl": {
+    "allowedUsers": [
+      { "id": "usr_alice" },
+      { "slackId": "U012ALICE" }
+    ]
+  },
+  "repositories": [...]
+}
+```
 
 ---
 
@@ -404,6 +573,28 @@ When `true`, conflict rebase automation can also work on PRs not opened by Cyrus
 ```
 
 ---
+
+### `codexSandboxMode`
+
+Controls Codex command execution for issue and chat sessions. Accepted values:
+
+- `workspace-write` (default): retain the existing sandbox and Cyrus filesystem profile when configured.
+- `read-only`: use Codex's native read-only sandbox.
+- `danger-full-access`: use Codex's native unrestricted mode. Every command in the session can access host files and network; Cyrus filesystem grants and egress sandbox restrictions do not constrain this mode.
+
+```json
+{
+  "codexSandboxMode": "workspace-write"
+}
+```
+
+This is an operator setting, independent of `sandbox.enabled`, which controls the
+egress proxy. It applies only to Codex; other runners and approval policy are
+unchanged. Config reloads affect newly constructed runners, not commands already
+in progress. Removing the field restores `workspace-write` for new runners.
+Selecting `read-only` or full access takes precedence over a generated filesystem
+profile and uses the corresponding native Codex mode.
+
 
 ## Tool Configuration Priority
 

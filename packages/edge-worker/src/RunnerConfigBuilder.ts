@@ -15,6 +15,7 @@ import type {
 	CyrusAgentSession,
 	ILogger,
 	OnAskUserQuestion,
+	OpenCodeConfigOverrides,
 	RepositoryConfig,
 	RunnerType,
 } from "cyrus-core";
@@ -23,6 +24,7 @@ import { buildPrMarkerHook } from "./hooks/PrMarkerHook.js";
 import { appendBrowserUseAddendum } from "./prompts/browserUsePromptAddendum.js";
 import { appendCloudRuntimeAddendum } from "./prompts/cloudRuntimePromptAddendum.js";
 import { appendFailureModeAddendum } from "./prompts/failureModePromptAddendum.js";
+import { appendGitHubCliMediaAddendum } from "./prompts/githubCliMediaPromptAddendum.js";
 
 /**
  * Subset of McpConfigService consumed by RunnerConfigBuilder.
@@ -52,6 +54,7 @@ export interface IChatToolResolver {
  * Subset of RunnerSelectionService consumed by RunnerConfigBuilder.
  */
 export interface IRunnerSelector {
+	getDefaultRunner(): RunnerType;
 	determineRunnerSelection(
 		labels: string[],
 		issueDescription?: string,
@@ -60,8 +63,8 @@ export interface IRunnerSelector {
 		modelOverride?: string;
 		fallbackModelOverride?: string;
 	};
-	getDefaultModelForRunner(runnerType: RunnerType): string;
-	getDefaultFallbackModelForRunner(runnerType: RunnerType): string;
+	getDefaultModelForRunner(runnerType: RunnerType): string | undefined;
+	getDefaultFallbackModelForRunner(runnerType: RunnerType): string | undefined;
 }
 
 /**
@@ -95,6 +98,8 @@ export interface ChatRunnerConfigInput {
 	 * run as usual).
 	 */
 	platformMcpConfigOverrides?: readonly string[];
+	/** Whether Claude should ignore ambient MCP configuration. Defaults to true. */
+	strictMcpConfig?: boolean;
 	/** Plugins to load for the chat session (provides managed skills). */
 	plugins?: SdkPluginConfig[];
 	/**
@@ -103,6 +108,12 @@ export interface ChatRunnerConfigInput {
 	 * these skills into its repository discovery layout.
 	 */
 	skills?: string[] | "all";
+	/** Global OpenCode runtime config overrides from Cyrus config */
+	opencodeGlobalConfig?: OpenCodeConfigOverrides["config"];
+	/** Global OpenCode CLI state scope from Cyrus config */
+	opencodeGlobalStateScope?: OpenCodeConfigOverrides["stateScope"];
+	/** Existing runner type to preserve when resuming a completed chat session */
+	runnerType?: RunnerType;
 	logger: ILogger;
 	onMessage: (message: SDKMessage) => void | Promise<void>;
 	onError: (error: Error) => void;
@@ -134,6 +145,8 @@ export interface IssueRunnerConfigInput {
 	 * (see `buildIssueConfig`).
 	 */
 	platformMcpConfigOverrides?: readonly string[];
+	/** Whether Claude should ignore ambient MCP configuration. Defaults to true. */
+	strictMcpConfig?: boolean;
 	linearWorkspaceId?: string;
 	sessionTempDir?: string;
 	cyrusHome: string;
@@ -149,17 +162,38 @@ export interface IssueRunnerConfigInput {
 	requireLinearWorkspaceId: (repo: RepositoryConfig) => string;
 	/** Plugins to load for the session (provides skills, hooks, etc.) */
 	plugins?: SdkPluginConfig[];
+	/** Global OpenCode runtime config overrides from Cyrus config */
+	opencodeGlobalConfig?: OpenCodeConfigOverrides["config"];
+	/** Global OpenCode CLI state scope from Cyrus config */
+	opencodeGlobalStateScope?: OpenCodeConfigOverrides["stateScope"];
 	/**
 	 * Allow-list of skill names enabled for the session (after scope filtering),
 	 * or `"all"` to enable every discovered skill, or `undefined` to defer to
-	 * provider defaults. Claude passes this to the SDK directly; Codex uses it
-	 * to stage the same scoped skills into its native repository discovery layout.
+	 * provider defaults. Managed-skill runners consume this according to their
+	 * native discovery layout.
 	 */
 	skills?: string[] | "all";
 	/** SDK sandbox settings (enabled, network proxy ports) for Claude runner */
 	sandboxSettings?: SandboxSettings;
 	/** CA cert path for MITM TLS termination — passed via child process env */
 	egressCaCertPath?: string;
+	/**
+	 * Operator-whitelisted extra writable paths (absolute), from
+	 * `sandbox.writablePaths` / `CYRUS_SANDBOX_WRITABLE_PATHS`. Always applied
+	 * for Codex; applied for Claude when the egress sandbox is enabled.
+	 */
+	sandboxWritablePaths?: string[];
+	/**
+	 * GitHub App installation token matched to the session repository's org
+	 * (from the cyrus-hosted-pushed token store). When set, it's exposed to
+	 * the session ONLY as `CYRUS_GH_TOKEN` — the droplet's gh wrapper maps
+	 * it to `GH_TOKEN` inside the gh process. We deliberately do NOT set
+	 * `GH_TOKEN` itself: customers set their own `GH_TOKEN` (e.g. for
+	 * private npm registries on GitHub Packages) and clobbering it would
+	 * break their installs. The managed gh resolver re-reads the store on
+	 * every invocation; this snapshot cannot authorize a removed token.
+	 */
+	githubToken?: string;
 }
 
 export function resolveIssueMcpConfigPath(
@@ -258,6 +292,8 @@ export class RunnerConfigBuilder {
 		);
 
 		input.logger.debug("Chat session allowed tools:", allowedTools);
+		const runnerType =
+			input.runnerType ?? this.runnerSelector.getDefaultRunner();
 
 		// Shared auto-memory across all chat threads on this platform. Lives
 		// under cyrusHome (not the per-thread workspace) so memory built up in
@@ -268,6 +304,7 @@ export class RunnerConfigBuilder {
 		);
 
 		return {
+			runnerType,
 			workingDirectory: input.workspacePath,
 			allowedTools,
 			disallowedTools: [] as string[],
@@ -282,15 +319,28 @@ export class RunnerConfigBuilder {
 			autoMemoryDirectory,
 			sessionTempDir: input.sessionTempDir,
 			appendSystemPrompt: appendCloudRuntimeAddendum(
-				appendBrowserUseAddendum(appendFailureModeAddendum(input.systemPrompt)),
+				appendGitHubCliMediaAddendum(
+					appendBrowserUseAddendum(
+						appendFailureModeAddendum(input.systemPrompt),
+					),
+				),
 			),
 			...(mcpConfig ? { mcpConfig } : {}),
 			...(mcpConfigPath ? { mcpConfigPath } : {}),
+			strictMcpConfig: input.strictMcpConfig ?? true,
 			...(input.resumeSessionId
 				? { resumeSessionId: input.resumeSessionId }
 				: {}),
 			...(input.plugins?.length ? { plugins: input.plugins } : {}),
 			...(input.skills !== undefined ? { skills: input.skills } : {}),
+			...(runnerType === "opencode" && {
+				opencodeGlobalConfig: input.opencodeGlobalConfig,
+				opencodeRepositoryConfig: input.repository?.opencode?.config,
+				opencodeStateScope:
+					input.repository?.opencode?.stateScope ??
+					input.opencodeGlobalStateScope,
+				opencodeStateKey: input.repository?.id,
+			}),
 			logger: input.logger,
 			maxTurns: 200,
 			onMessage: input.onMessage,
@@ -355,6 +405,11 @@ export class RunnerConfigBuilder {
 			modelOverride = this.runnerSelector.getDefaultModelForRunner("cursor");
 			fallbackModelOverride =
 				this.runnerSelector.getDefaultFallbackModelForRunner("cursor");
+		} else if (input.session.opencodeSessionId && runnerType !== "opencode") {
+			runnerType = "opencode";
+			modelOverride = this.runnerSelector.getDefaultModelForRunner("opencode");
+			fallbackModelOverride =
+				this.runnerSelector.getDefaultFallbackModelForRunner("opencode");
 		}
 
 		// Log model override if found
@@ -417,8 +472,13 @@ export class RunnerConfigBuilder {
 			sessionTempDir: input.sessionTempDir,
 			mcpConfigPath,
 			mcpConfig,
+			strictMcpConfig: input.strictMcpConfig ?? true,
 			appendSystemPrompt: appendCloudRuntimeAddendum(
-				appendBrowserUseAddendum(appendFailureModeAddendum(input.systemPrompt)),
+				appendGitHubCliMediaAddendum(
+					appendBrowserUseAddendum(
+						appendFailureModeAddendum(input.systemPrompt),
+					),
+				),
 			),
 			// Priority order: label override > repository config > global default
 			model: finalModel,
@@ -434,9 +494,8 @@ export class RunnerConfigBuilder {
 			// Plugins providing managed skills.
 			...(this.runnerSupportsManagedSkills(runnerType) &&
 				input.plugins?.length && { plugins: input.plugins }),
-			// Skill scope allow-list. Claude passes this through to the SDK's
-			// `query()` `skills` option; Codex uses it to stage only allowed skill
-			// directories into the session worktree for repository-scope discovery.
+			// Skill scope allow-list. Each managed-skill runner maps this into its
+			// native skill discovery mechanism.
 			...(this.runnerSupportsManagedSkills(runnerType) &&
 				input.skills !== undefined && { skills: input.skills }),
 			// SDK sandbox settings (Claude runner only):
@@ -453,9 +512,31 @@ export class RunnerConfigBuilder {
 						resolvedWorkspaceId,
 					),
 				}),
+			...(runnerType === "opencode" && {
+				opencodeGlobalConfig: input.opencodeGlobalConfig,
+				opencodeRepositoryConfig: input.repository.opencode?.config,
+				opencodeStateScope:
+					input.repository.opencode?.stateScope ??
+					input.opencodeGlobalStateScope,
+				opencodeStateKey: input.repository.id,
+			}),
 			onMessage: input.onMessage,
 			onError: input.onError,
 		};
+
+		// Expose the org-matched GitHub App installation token to the session
+		// env. Merged on top of any sandbox additionalEnv (CA cert vars) so
+		// both survive. Only set when a token store entry matched the repo's
+		// org — sessions without a match see zero env change. CYRUS_GH_TOKEN
+		// only — never GH_TOKEN, which customers set themselves (e.g. private
+		// npm registries on GitHub Packages); the droplet's gh wrapper maps
+		// CYRUS_GH_TOKEN to GH_TOKEN inside the gh process.
+		if (input.githubToken) {
+			config.additionalEnv = {
+				...config.additionalEnv,
+				CYRUS_GH_TOKEN: input.githubToken,
+			};
+		}
 
 		// Cursor runner uses @cursor/sdk. Pass through API key, the same
 		// sandboxSettings shape Claude consumes (the runner translates it to
@@ -483,6 +564,39 @@ export class RunnerConfigBuilder {
 				allowWrite: [input.session.workspace.path],
 				allowRead: [input.session.workspace.path, ...input.allowedDirectories],
 			};
+		}
+
+		// Operator-whitelisted extra writable paths (e.g. `~/.supabase`). Codex
+		// adds these as writable roots in both its default workspace-write mode
+		// and the egress-sandbox profile, so containment is otherwise unchanged.
+		if (runnerType === "codex" && input.sandboxWritablePaths?.length) {
+			config.writableRoots = input.sandboxWritablePaths;
+		}
+
+		// Claude with the egress sandbox: the OS sandbox side is handled in
+		// buildSandboxConfig. On the tool-permission side, treat the paths as
+		// allowed directories (Read allow + exemption from the home-directory
+		// Read denylist) and grant Edit/Write on them — but only when the
+		// session already has Edit/Write, so read-only tool sets stay read-only.
+		if (
+			runnerType === "claude" &&
+			input.sandboxSettings &&
+			input.sandboxWritablePaths?.length
+		) {
+			const extra = input.sandboxWritablePaths;
+			config.allowedDirectories = [...input.allowedDirectories, ...extra];
+			const hasTool = (name: string) =>
+				input.allowedTools.some((t) => t === name || t.startsWith(`${name}(`));
+			const writeTools = ["Edit", "Write"].filter(hasTool);
+			if (writeTools.length > 0) {
+				// Absolute paths need an extra leading `/` in Claude tool patterns.
+				config.allowedTools = [
+					...input.allowedTools,
+					...writeTools.flatMap((tool) =>
+						extra.map((p) => `${tool}(/${p}/**)`),
+					),
+				];
+			}
 		}
 
 		if (input.resumeSessionId) {
@@ -555,12 +669,19 @@ export class RunnerConfigBuilder {
 					// See: https://code.claude.com/docs/en/settings#sandbox-path-prefixes
 					// allowedDirectories contains the attachments dir, repo paths, and git
 					// metadata dirs — all of which need OS-level read access alongside the worktree.
-					allowRead: [".", ...input.allowedDirectories],
+					// Operator-whitelisted writable paths (sandbox.writablePaths) are
+					// also readable, carving them out of the `~/` deny.
+					allowRead: [
+						".",
+						...input.allowedDirectories,
+						...(input.sandboxWritablePaths ?? []),
+					],
 					denyRead: ["~/"],
 					// Restrict subprocess writes to the session worktree and its temp dir
 					allowWrite: [
 						input.session.workspace.path,
 						...(input.sessionTempDir ? [input.sessionTempDir] : []),
+						...(input.sandboxWritablePaths ?? []),
 					],
 				},
 			};

@@ -12,24 +12,35 @@ import { createLogger, type ILogger } from "../logging/index.js";
 /**
  * Known webhook source IPs/CIDRs for supported providers.
  *
- * Linear: https://linear.app/developers/webhooks#securing-webhooks
+ * Linear: https://linear.app/docs/security (verified 2026-09-15)
+ * Published set: https://linear.app/.well-known/appspecific/app.linear.ips.json
+ * Plain Linear IPs below match the published /32 entries exactly.
  * GitHub: https://api.github.com/meta (hooks field)
  * GitLab: https://docs.gitlab.com/ee/user/gitlab_com/#ip-range
  */
 export const LINEAR_WEBHOOK_IPS = [
 	"35.231.147.226",
 	"35.243.134.228",
+	"35.196.141.51",
 	"34.140.253.14",
 	"34.38.87.206",
+	"34.62.119.29",
 	"34.134.222.122",
 	"35.222.25.142",
+	"34.60.255.158",
+	"34.186.126.124",
+	"34.48.40.158",
+	"35.236.218.67",
 ] as const;
 
 /**
- * Fallback GitHub webhook CIDRs (from /meta API as of 2025).
+ * Fallback GitHub webhook IPv4 CIDRs (from /meta API as of 2026-11-01).
  * These are used when the /meta API is unavailable.
  */
 export const GITHUB_WEBHOOK_CIDRS_FALLBACK = [
+	"9.234.98.160/28",
+	"9.234.98.176/28",
+	"9.234.106.48/28",
 	"192.30.252.0/22",
 	"185.199.108.0/22",
 	"140.82.112.0/20",

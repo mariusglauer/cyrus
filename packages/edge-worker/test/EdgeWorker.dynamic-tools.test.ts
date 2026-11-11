@@ -35,7 +35,6 @@ vi.mock("cyrus-claude-runner", () => ({
 		"CronList",
 		"ScheduleWakeup",
 		"Monitor",
-		"TaskOutput",
 		"TaskStop",
 		"ToolSearch",
 		"DesignSync",
@@ -54,7 +53,6 @@ vi.mock("cyrus-claude-runner", () => ({
 		"Task",
 		"Skill",
 		"Monitor",
-		"TaskOutput",
 		"EnterPlanMode",
 		"ExitPlanMode",
 		"ToolSearch",
@@ -87,7 +85,6 @@ vi.mock("cyrus-claude-runner", () => ({
 		"CronList",
 		"ScheduleWakeup",
 		"Monitor",
-		"TaskOutput",
 		"TaskStop",
 		"ToolSearch",
 		"DesignSync",
@@ -338,6 +335,7 @@ describe("EdgeWorker - Dynamic Tools Configuration", () => {
 			// LINEAR_DEFAULT_ALLOWED_TOOLS already includes mcp__linear,
 			// mcp__cyrus-tools, mcp__cyrus-docs explicitly — no appending.
 			expect(tools).toEqual([...LINEAR_DEFAULT_ALLOWED_TOOLS]);
+			expect(tools).toContain("Bash");
 		});
 
 		it("LINEAR_DEFAULT_ALLOWED_TOOLS explicitly includes the workspace MCP prefixes", () => {

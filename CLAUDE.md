@@ -61,7 +61,7 @@ To see Cyrus in action, refer to the test drives in `apps/f1/test-drives/`. Thes
 
 The F1 (Formula 1) testing framework provides a controlled environment to test Cyrus without affecting production Linear workspaces.
 
-CRITICAL: you must use the f1 test drive protocol during the 'testing and validation' stage of any major work undertaking. You CAN also use it in development situations where you want to test drive the version of the product that you're working on.
+Choose validation by the actual changed behavior, not the size of the task or filenames. Follow the canonical [F1 applicability policy](skills/f1-test-drive/SKILL.md#applicability-required-before-setup): F1-covered product/runtime changes and functional changes to the F1 harness require relevant F1 validation. Changes with no relevant workflow behavior use targeted checks and a brief PR validation note, without running F1 or creating, attaching, or committing an F1 report. For releases, assess the full payload since the previous release, not just the release PR. Preserve historical test-drive evidence.
 
 ## Linear Webhooks Reference
 
@@ -251,6 +251,20 @@ For a detailed visual representation of how these components interact and map Cl
 
 ## Testing Best Practices
 
+### Proportionate Verification
+
+Follow the canonical [verification policy](skills/verify-and-ship/SKILL.md#2-quality-checks).
+Every change needs appropriate verification, not necessarily new automated tests
+or a full-suite run. Routine release scripts, packaging, CI, documentation, and
+instruction edits often need only syntax checks, a safe dry run, install smoke
+checks, or direct review. Add tests for concrete consequential failures when
+ongoing protection outweighs maintenance. Avoid brittle text/source assertions,
+implementation-mirroring tests, and scaffolding that costs more than it protects.
+Preserve safeguards against wrong artifact publication, unintended stable-tag
+moves, invalid release evidence, and other consequential regressions. Choose by
+behavior and risk, never filenames alone; retain required CI gates and relevant
+functional F1 validation.
+
 ### Prompt Assembly Tests
 
 When working with prompt assembly tests in `packages/edge-worker/test/prompt-assembly*.test.ts`:
@@ -399,7 +413,7 @@ The agent automatically moves issues to the "started" state when assigned. Linea
 
 3. **Git Worktrees**: When processing issues, the agent creates separate git worktrees. If a `cyrus-setup.sh` script exists in the repository root, it's executed in new worktrees for project-specific initialization. Symmetrically, if a `cyrus-teardown.sh` script exists in the repository root, it's executed in the worktree directory immediately before the worktree is removed when the issue reaches a terminal state (completed / canceled / deleted).
 
-4. **Testing**: Uses Vitest for all packages. Run tests before committing changes.
+4. **Testing**: Uses Vitest for automated tests. Choose proportionate pre-commit validation using the policy above; do not add tests solely because a file changed.
 
 5. **Sandbox Egress Proxy & CA Certificates**: When sandbox is enabled, the egress proxy generates a CA cert at `~/.cyrus/certs/cyrus-egress-ca.pem` for TLS interception. Per-session env vars are set in `RunnerConfigBuilder.buildSandboxConfig()` to cover most tools:
    - `NODE_EXTRA_CA_CERTS` (Node.js), `GIT_SSL_CAINFO` (Git), `SSL_CERT_FILE` (OpenSSL/Ruby), `REQUESTS_CA_BUNDLE` / `PIP_CERT` (Python), `CURL_CA_BUNDLE` (curl/OpenSSL), `CARGO_HTTP_CAINFO` (Rust), `AWS_CA_BUNDLE` (AWS CLI), `DENO_CERT` (Deno)
@@ -434,15 +448,15 @@ The agent automatically moves issues to the "started" state when assigned. Linea
 8. **Routing Behavior & Self-Describing Prompts**: When changing repository routing behavior (e.g., description-tag syntax, label routing, base branch overrides, multi-repo support), you **must also update the system prompts that describe these capabilities to Cyrus itself**. The product relies on self-describing prompts so that Cyrus can correctly instruct users and create properly-routed sub-issues. Known locations (not exhaustive):
    - `packages/edge-worker/src/PromptBuilder.ts` — Generates the `<repository_routing_context>` XML block included in session system prompts, documenting routing methods and priority order
    - `packages/edge-worker/src/SlackChatAdapter.ts` — Builds the Slack chat system prompt including orchestration notes with repo routing syntax
+   - `packages/edge-worker/src/ZulipChatAdapter.ts` — Same, for the Zulip chat system prompt
    - `packages/edge-worker/src/ActivityPoster.ts` — Posts routing activities to Linear timeline (method display names, formatting)
 
-9. **Adding a new top-level `EdgeWorkerConfig` field**: Adding a property to the `EdgeWorkerConfig` Zod schema in `packages/core/src/config-schemas.ts` is **not enough** to make it available at runtime. `ConfigManager.loadConfigSafely()` in `packages/edge-worker/src/ConfigManager.ts` reads `config.json`, then explicitly merges a **hardcoded whitelist** of fields onto its in-memory config — every field not on that list is silently dropped on each reload. Likewise, `detectGlobalConfigChanges()` only fires a `configChanged` event when one of a hardcoded list of keys differs from the previous reload.
+9. **Adding a new top-level `EdgeWorkerConfig` field**: Adding a property to the `EdgeConfigSchema` Zod schema in `packages/core/src/config-schemas.ts` is **not enough** to make it available at runtime. Two hand-maintained copy sites exist, and both now have guardrails that fail fast when a field is missed (added after `strictMcpConfig` was silently dropped in CYPACK-1478; `slackAllowedTools` & friends were dropped the same way in CYHOST-967):
 
-   When you add a new top-level field you **must update both lists**:
-   - The merge in `loadConfigSafely()` (around line ~200) — add `<newField>: parsedConfig.<newField> || this.config.<newField>`.
-   - The `globalKeys` array in `detectGlobalConfigChanges()` — add the field name so changes to it trigger downstream `setConfig` calls on dependent services (e.g., `ToolPermissionResolver`).
+   - **Cold start** — `WorkerService.startEdgeWorker()` in `apps/cli/src/services/WorkerService.ts` spreads the entire file config (`...edgeConfig`) into the `EdgeWorkerConfig`, so plain pass-through fields flow automatically and need **no** code change. Only add an explicit line below the spread if the field needs env-var precedence or a computed/param override — never add a redundant pass-through line. The `"forwards every EdgeConfig field"` test in `WorkerService.test.ts` has a schema-complete fixture that fails when a new schema field isn't covered.
+   - **Hot reload** — `ConfigManager` in `packages/edge-worker/src/ConfigManager.ts` merges a hardcoded list of fields in `loadConfigSafely()` and watches the same list in `detectGlobalConfigChanges()`. Both are driven by the `RELOAD_MERGED_KEYS` const at the top of the file, which has a **compile-time exhaustiveness check**: adding a schema field without classifying it into `RELOAD_MERGED_KEYS` (plus a merge line in `loadConfigSafely()`) or `RELOAD_EXEMPT_KEYS` is a `tsc` error that names the missing key.
 
-   Symptom of forgetting this: the field appears in `~/.cyrus/config.json`, the cyrus process is restarted, but downstream code keeps seeing the default (or never picks up hot-reloads). This bit us with `slackAllowedTools` / `githubAllowedTools` / `slackMcpConfigs` / `linearMcpConfigs` / `githubMcpConfigs` during CYHOST-967.
+   So the workflow for a new field is: add it to `EdgeConfigSchema`, let `tsc` and the CLI test point at the two sites, add the merge line + `RELOAD_MERGED_KEYS` entry (hot reload) and — only if it needs env precedence — an explicit override in `startEdgeWorker()`.
 
 10. **Changing the `cyrus-tools` MCP server's exposed tools**: When you add or remove a tool from the inline `cyrus-tools` MCP server (the one served by `apps/proxy` / wired up in `McpConfigService.buildMcpConfig`), you **must also update the catalog `cyrus-hosted` keeps for the `/settings/tools` UI**. cyrus-hosted maintains a per-server tool list so its grid can render a row per tool (with the right per-platform toggle) without having to introspect a live MCP server. Today that catalog lives in `apps/app/src/lib/cyrus-config/builder.ts` under the `KNOWN_MCP_TOOLS` map (look for the `"mcp__cyrus-tools"` key); update that array in the same PR — the same constants are also imported by the platform-default lists in `packages/core/src/allowed-tools-defaults.ts` when a particular `cyrus-tools` tool is enabled by default, so reflect that there too if the new tool should be on out of the box.
 
@@ -468,7 +482,7 @@ transitive-dependency vulnerabilities:
    transitive. Regenerate the lockfile and let pnpm's natural resolution do the
    work.
 
-2. **Only use root `pnpm.overrides` when a direct-dep bump cannot reach the
+2. **Only use workspace-level overrides in `pnpm-workspace.yaml` when a direct-dep bump cannot reach the
    vulnerable transitive.** This is the fallback for deep transitives (3+
    levels deep) whose owning direct dep has no released version that resolves
    to the patched transitive — typically because upstream hasn't released yet
@@ -477,7 +491,7 @@ transitive-dependency vulnerabilities:
 
 3. **Always clean up overrides when a future dep bump makes them redundant.**
    When you update a direct dependency (security or otherwise), check whether
-   any existing entry in `pnpm.overrides` is now satisfied naturally by the
+   any existing override entry is now satisfied naturally by the
    new resolution. If so, **remove that override in the same change**. Verify
    with `pnpm install && pnpm audit` that the removal is safe before committing.
 
@@ -499,9 +513,8 @@ When working on this codebase, follow these practices:
    - Use appropriate subsections: `### Added`, `### Changed`, `### Fixed`, `### Removed`
    - Include brief, clear descriptions of what was changed and why
    - **Include the PR number/link**: If the PR is already created, include the link (e.g., `([#123](https://github.com/ceedaragents/cyrus/pull/123))`). If not, create the PR first, then update the changelog with the link, commit, and push.
-   - Run `pnpm test:packages` to ensure all package tests pass
-   - Run `pnpm typecheck` to verify TypeScript compilation
-   - Consider running `pnpm build` to ensure the build succeeds
+   - Run relevant existing checks per the verification policy; use `pnpm test:packages:run` when package-wide regression coverage is warranted
+   - Run `pnpm typecheck` and `pnpm build` when affected by the change or required by repository hooks/CI
 
 2. **Internal Changelog**:
    - For internal development changes, refactors, tooling updates, or other non-user-facing modifications, update `CHANGELOG.internal.md`.

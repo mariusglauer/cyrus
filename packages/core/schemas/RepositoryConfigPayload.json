@@ -433,6 +433,16 @@
 								},
 								"required": ["email"],
 								"additionalProperties": false
+							},
+							{
+								"type": "object",
+								"properties": {
+									"slackId": {
+										"type": "string"
+									}
+								},
+								"required": ["slackId"],
+								"additionalProperties": false
 							}
 						]
 					}
@@ -463,6 +473,16 @@
 								},
 								"required": ["email"],
 								"additionalProperties": false
+							},
+							{
+								"type": "object",
+								"properties": {
+									"slackId": {
+										"type": "string"
+									}
+								},
+								"required": ["slackId"],
+								"additionalProperties": false
 							}
 						]
 					}
@@ -476,8 +496,60 @@
 				}
 			},
 			"additionalProperties": false
+		},
+		"opencode": {
+			"type": "object",
+			"properties": {
+				"stateScope": {
+					"type": "string",
+					"enum": ["inherit", "shared", "repository"]
+				},
+				"config": {
+					"type": "object",
+					"propertyNames": {
+						"type": "string"
+					},
+					"additionalProperties": {
+						"$ref": "#/$defs/__schema0"
+					}
+				}
+			},
+			"additionalProperties": false
 		}
 	},
 	"required": ["id", "name", "repositoryPath", "baseBranch"],
-	"additionalProperties": false
+	"additionalProperties": false,
+	"$defs": {
+		"__schema0": {
+			"anyOf": [
+				{
+					"type": "string"
+				},
+				{
+					"type": "number"
+				},
+				{
+					"type": "boolean"
+				},
+				{
+					"type": "null"
+				},
+				{
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/__schema0"
+					}
+				},
+				{
+					"type": "object",
+					"propertyNames": {
+						"type": "string"
+					},
+					"additionalProperties": {
+						"$ref": "#/$defs/__schema0"
+					}
+				}
+			]
+		}
+	}
 }

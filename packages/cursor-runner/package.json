@@ -1,7 +1,12 @@
 {
 	"name": "cyrus-cursor-runner",
-	"version": "0.2.66",
+	"version": "0.2.76",
 	"description": "Cursor Agent CLI process wrapper for Cyrus",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/cyrusagents/cyrus.git",
+		"directory": "packages/cursor-runner"
+	},
 	"type": "module",
 	"main": "dist/index.js",
 	"types": "dist/index.d.ts",
@@ -9,21 +14,21 @@
 		"dist"
 	],
 	"scripts": {
-		"build": "tsc && node -e \"require('node:fs').copyFileSync('src/permission-check.mjs', 'dist/permission-check.mjs')\"",
-		"dev": "tsc --watch",
+		"build": "tsgo && node -e \"require('node:fs').copyFileSync('src/permission-check.mjs', 'dist/permission-check.mjs')\"",
+		"dev": "tsgo --watch",
 		"test": "node ../../node_modules/.pnpm/node_modules/vitest/vitest.mjs",
 		"test:run": "node ../../node_modules/.pnpm/node_modules/vitest/vitest.mjs run --passWithNoTests",
-		"typecheck": "tsc --noEmit"
+		"typecheck": "tsgo --noEmit"
 	},
 	"dependencies": {
-		"@cursor/sdk": "^1.0.19",
+		"@cursor/sdk": "^1.1.0",
 		"cyrus-core": "workspace:*",
 		"cyrus-simple-agent-runner": "workspace:*"
 	},
 	"devDependencies": {
 		"@types/node": "^20.0.0",
-		"typescript": "^5.3.3",
-		"vitest": "^4.1.9"
+		"@typescript/native-preview": "7.0.0-dev.20260707.2",
+		"vitest": "^4.1.12"
 	},
 	"publishConfig": {
 		"access": "public"

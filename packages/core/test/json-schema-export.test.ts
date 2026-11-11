@@ -43,6 +43,9 @@ describe("JSON Schema export", () => {
 				"claudeDefaultFallbackModel",
 				"geminiDefaultModel",
 				"codexDefaultModel",
+				"opencodeDefaultModel",
+				"opencodeDefaultFallbackModel",
+				"inferOpenCodeRunnerFromProviderModel",
 				"defaultRunner",
 				"defaultModel",
 				"defaultFallbackModel",
@@ -55,6 +58,7 @@ describe("JSON Schema export", () => {
 				"slackMcpConfigs",
 				"linearMcpConfigs",
 				"githubMcpConfigs",
+				"strictMcpConfig",
 				"issueUpdateTrigger",
 				"prReviewTrigger",
 				"githubConflictRebaseTrigger",
@@ -77,6 +81,7 @@ describe("JSON Schema export", () => {
 				"gemini",
 				"codex",
 				"cursor",
+				"opencode",
 			]);
 		});
 
@@ -87,6 +92,13 @@ describe("JSON Schema export", () => {
 			expect(uac.properties).toHaveProperty("blockedUsers");
 			expect(uac.properties).toHaveProperty("blockBehavior");
 			expect(uac.properties).toHaveProperty("blockMessage");
+		});
+
+		it("includes slackId among the user identifier shapes", () => {
+			const uac = schema.properties.userAccessControl;
+			expect(uac.properties.allowedUsers.items.anyOf).toContainEqual(
+				expect.objectContaining({ required: ["slackId"] }),
+			);
 		});
 
 		it("represents promptDefaults with prompt type keys", () => {

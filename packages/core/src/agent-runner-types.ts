@@ -11,6 +11,7 @@ import type {
 // Import the AskUserQuestionInput type from the SDK's tool input types
 // This ensures we use the SDK's official type definitions
 import type { AskUserQuestionInput as SDKAskUserQuestionInput } from "@anthropic-ai/claude-agent-sdk/sdk-tools";
+import type { OpenCodeStateScope, RunnerType } from "./config-schemas.js";
 import type { ILogger } from "./logging/ILogger.js";
 
 // ============================================================================
@@ -422,6 +423,15 @@ export interface IAgentRunner {
 	getFormatter(): IMessageFormatter;
 }
 
+export type JsonValue =
+	| string
+	| number
+	| boolean
+	| null
+	| JsonValue[]
+	| JsonObject;
+export type JsonObject = { [key: string]: JsonValue };
+
 /**
  * Configuration for agent runner
  *
@@ -461,6 +471,8 @@ export interface AgentRunnerConfig {
 	additionalDirectories?: string[];
 	/** Session ID to resume from a previous session */
 	resumeSessionId?: string;
+	/** Runner implementation that owns resumeSessionId, used to avoid cross-runner resumes */
+	runnerType?: RunnerType;
 	/** Workspace name for logging and organization */
 	workspaceName?: string;
 	/** Additional text to append to default system prompt */
@@ -469,6 +481,19 @@ export interface AgentRunnerConfig {
 	mcpConfigPath?: string | string[];
 	/** MCP server configurations (inline) */
 	mcpConfig?: Record<string, McpServerConfig>;
+	/**
+	 * Whether Claude should use only MCP servers explicitly supplied by Cyrus.
+	 * Defaults to true for Claude sessions.
+	 */
+	strictMcpConfig?: boolean;
+	/** Global OpenCode runtime config overrides from Cyrus config */
+	opencodeGlobalConfig?: JsonObject;
+	/** Repository OpenCode runtime config overrides from Cyrus config */
+	opencodeRepositoryConfig?: JsonObject;
+	/** OpenCode CLI config/state/cache scope. Defaults to inheriting parent env. */
+	opencodeStateScope?: OpenCodeStateScope;
+	/** Stable key used when opencodeStateScope is repository. */
+	opencodeStateKey?: string;
 	/** AI model to use (e.g., "opus", "sonnet", "haiku") */
 	model?: string;
 	/** Fallback model if primary is unavailable */
@@ -479,6 +504,13 @@ export interface AgentRunnerConfig {
 	tools?: string[];
 	/** Cyrus home directory (required) */
 	cyrusHome: string;
+	/**
+	 * Additional environment variables for the agent child process, merged on
+	 * top of the inherited process env. Used for per-session credentials
+	 * (e.g. org-matched GH_TOKEN) and sandbox CA cert paths. Currently only
+	 * the Claude runner consumes this.
+	 */
+	additionalEnv?: Record<string, string>;
 	/**
 	 * Custom directory path for Claude's auto-memory storage. Forwarded to the
 	 * Claude SDK as settings.autoMemoryDirectory. When unset, the SDK falls

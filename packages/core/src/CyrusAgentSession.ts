@@ -98,6 +98,7 @@ export interface CyrusAgentSession {
 	geminiSessionId?: string; // Gemini-specific session ID (assigned once it initializes)
 	codexSessionId?: string; // Codex-specific session ID (assigned once it initializes)
 	cursorSessionId?: string; // Cursor-specific session ID (assigned once it initializes)
+	opencodeSessionId?: string; // OpenCode-specific session ID (assigned once it initializes)
 	agentRunner?: IAgentRunner;
 	metadata?: {
 		model?: string;
@@ -108,6 +109,8 @@ export interface CyrusAgentSession {
 		usage?: any;
 		commentId?: string;
 		sessionTempDir?: string;
+		/** Chat sessions: thread position up to which this session has context */
+		lastContextTs?: string;
 	};
 }
 
@@ -116,6 +119,7 @@ export interface CyrusAgentSessionEntry {
 	geminiSessionId?: string; // originated in this Gemini session (if using Gemini)
 	codexSessionId?: string; // originated in this Codex session (if using Codex)
 	cursorSessionId?: string; // originated in this Cursor session (if using Cursor)
+	opencodeSessionId?: string; // originated in this OpenCode session (if using OpenCode)
 	linearAgentActivityId?: string; // got assigned this ID in linear, after creation, for this 'agent activity'
 	type: "user" | "assistant" | "system" | "result";
 	content: string;

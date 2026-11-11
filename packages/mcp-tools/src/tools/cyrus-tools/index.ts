@@ -7,11 +7,16 @@ import OpenAI from "openai";
 import { z } from "zod";
 import { registerImageTools } from "../image-tools/index.js";
 import { registerSoraTools } from "../sora-tools/index.js";
+import { registerGetAgentSessionContentsTool } from "./get-agent-session-contents.js";
 import {
 	type FailureModesHttpClient,
 	type ResolveSessionFromCwd,
 	registerLogFailureModeTool,
 } from "./log-failure-mode.js";
+import {
+	type CodexMessagePublisher,
+	registerPostMessageToCodexTool,
+} from "./post-message-to-codex.js";
 
 /**
  * Detect MIME type based on file extension
@@ -80,6 +85,8 @@ function getMimeType(filename: string): string {
  * Options for creating Cyrus tools with session management capabilities
  */
 export interface CyrusToolsOptions {
+	/** Runtime-authenticated Hosted publisher; absent without a control plane. */
+	postMessageToCodex?: CodexMessagePublisher;
 	/**
 	 * Callback to register a child-to-parent session mapping
 	 * Called when a new agent session is created
@@ -121,6 +128,9 @@ export function createCyrusToolsServer(
 		name: "cyrus-tools",
 		version: "1.0.0",
 	});
+	registerGetAgentSessionContentsTool(server, linearClient);
+	if (options.postMessageToCodex)
+		registerPostMessageToCodexTool(server, options.postMessageToCodex);
 
 	server.registerTool(
 		"linear_upload_file",
@@ -235,190 +245,6 @@ export function createCyrusToolsServer(
 								filename: finalFilename,
 								size,
 								contentType: finalContentType,
-							}),
-						},
-					],
-				};
-			} catch (error) {
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: JSON.stringify({
-								success: false,
-								error: error instanceof Error ? error.message : String(error),
-							}),
-						},
-					],
-				};
-			}
-		},
-	);
-
-	server.registerTool(
-		"linear_agent_session_create",
-		{
-			description:
-				"Create an agent session on a Linear issue to track AI/bot activity.",
-			inputSchema: {
-				issueId: z
-					.string()
-					.describe(
-						'The ID or identifier of the Linear issue (e.g., "ABC-123" or UUID)',
-					),
-				externalLink: z
-					.string()
-					.optional()
-					.describe(
-						"Optional URL of an external agent-hosted page associated with this session",
-					),
-			},
-		},
-		async ({ issueId, externalLink }) => {
-			try {
-				const graphQLClient = (linearClient as any).client;
-
-				const mutation = `
-					mutation AgentSessionCreateOnIssue($input: AgentSessionCreateOnIssue!) {
-						agentSessionCreateOnIssue(input: $input) {
-							success
-							lastSyncId
-							agentSession {
-								id
-							}
-						}
-					}
-				`;
-
-				const variables = {
-					input: {
-						issueId,
-						...(externalLink && { externalLink }),
-					},
-				};
-
-				const response = await graphQLClient.rawRequest(mutation, variables);
-				const result = response.data.agentSessionCreateOnIssue;
-
-				if (!result.success) {
-					return {
-						content: [
-							{
-								type: "text" as const,
-								text: JSON.stringify({
-									success: false,
-									error: "Failed to create agent session",
-								}),
-							},
-						],
-					};
-				}
-
-				const agentSessionId = result.agentSession.id;
-				if (options.parentSessionId && options.onSessionCreated) {
-					options.onSessionCreated(agentSessionId, options.parentSessionId);
-				}
-
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: JSON.stringify({
-								success: result.success,
-								agentSessionId,
-								lastSyncId: result.lastSyncId,
-							}),
-						},
-					],
-				};
-			} catch (error) {
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: JSON.stringify({
-								success: false,
-								error: error instanceof Error ? error.message : String(error),
-							}),
-						},
-					],
-				};
-			}
-		},
-	);
-
-	server.registerTool(
-		"linear_agent_session_create_on_comment",
-		{
-			description:
-				"Create an agent session on a Linear root comment (not a reply) to trigger a sub-agent for processing child issues or tasks. See Linear API docs: https://studio.apollographql.com/public/Linear-API/variant/current/schema/reference/inputs/AgentSessionCreateOnComment",
-			inputSchema: {
-				commentId: z
-					.string()
-					.describe(
-						"The ID of the Linear root comment (not a reply) to create the session on",
-					),
-				externalLink: z
-					.string()
-					.optional()
-					.describe(
-						"Optional URL of an external agent-hosted page associated with this session",
-					),
-			},
-		},
-		async ({ commentId, externalLink }) => {
-			try {
-				const graphQLClient = (linearClient as any).client;
-
-				const mutation = `
-					mutation AgentSessionCreateOnComment($input: AgentSessionCreateOnComment!) {
-						agentSessionCreateOnComment(input: $input) {
-							success
-							lastSyncId
-							agentSession {
-								id
-							}
-						}
-					}
-				`;
-
-				const variables = {
-					input: {
-						commentId,
-						...(externalLink && { externalLink }),
-					},
-				};
-
-				const response = await graphQLClient.rawRequest(mutation, variables);
-				const result = response.data.agentSessionCreateOnComment;
-
-				if (!result.success) {
-					return {
-						content: [
-							{
-								type: "text" as const,
-								text: JSON.stringify({
-									success: false,
-									error: "Failed to create agent session on comment",
-								}),
-							},
-						],
-					};
-				}
-
-				const agentSessionId = result.agentSession.id;
-				if (options.parentSessionId && options.onSessionCreated) {
-					options.onSessionCreated(agentSessionId, options.parentSessionId);
-				}
-
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: JSON.stringify({
-								success: result.success,
-								agentSessionId,
-								lastSyncId: result.lastSyncId,
 							}),
 						},
 					],

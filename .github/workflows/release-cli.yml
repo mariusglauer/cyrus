@@ -1,0 +1,492 @@
+name: Release Cyrus CLI
+
+run-name: >-
+  ${{ inputs.dry_run && 'Dry run' || 'Release' }}
+  cyrus-ai@${{ inputs.version }} (${{ inputs.dist_tag }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_mode:
+        description: Stable main release or isolated npm test channel
+        type: choice
+        required: true
+        default: stable
+        options: [stable, test]
+      candidate_sha:
+        description: Test mode only - full reviewed immutable candidate commit
+        type: string
+        default: ""
+      version:
+        description: Exact version already committed in every release package
+        required: true
+        type: string
+      dist_tag:
+        description: npm distribution tag
+        required: true
+        default: latest
+        type: string
+      dry_run:
+        description: Build and verify every package without publishing or tagging
+        required: true
+        default: false
+        type: boolean
+
+concurrency:
+  group: release-cyrus-cli
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    if: ${{ inputs.release_mode == 'stable' }}
+    permissions:
+      contents: write
+      id-token: write
+    name: Verify and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+      REQUESTED_VERSION: ${{ inputs.version }}
+      DIST_TAG: ${{ inputs.dist_tag }}
+      DRY_RUN: ${{ inputs.dry_run }}
+
+    steps:
+      - name: Require the main branch
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "Cyrus releases must be dispatched from main; received $GITHUB_REF." >&2
+            exit 1
+          fi
+
+      - name: Initialize release paths
+        shell: bash
+        run: echo "RELEASE_ARTIFACTS=$RUNNER_TEMP/cyrus-release" >> "$GITHUB_ENV"
+
+      - name: Check out the release source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node and npm registry
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24.18.0"
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Install the repository pnpm version
+        shell: bash
+        run: |
+          PNPM_VERSION="$(node -p 'require("./package.json").packageManager.split("@")[1]')"
+          corepack enable
+          corepack prepare "pnpm@${PNPM_VERSION}" --activate
+          pnpm --version
+
+      - name: Validate the release request
+        shell: bash
+        run: |
+          test -z "$CANDIDATE_SHA"
+          [[ "$DIST_TAG" =~ ^(latest|next|beta)$ ]]
+          node scripts/release-packages.mjs validate "$REQUESTED_VERSION"
+
+          if git rev-parse --verify --quiet "refs/tags/v${REQUESTED_VERSION}"; then
+            if [[ "$DRY_RUN" == "true" ]]; then
+              echo "::warning::Tag v${REQUESTED_VERSION} already exists; continuing because this is a dry run."
+            else
+              echo "Tag v${REQUESTED_VERSION} already exists." >&2
+              exit 1
+            fi
+          fi
+
+          missing_packages=()
+          while IFS=$'\t' read -r directory package_name; do
+            if ! npm view "$package_name" version >/dev/null 2>&1; then
+              missing_packages+=("$package_name")
+            fi
+          done < <(node scripts/release-packages.mjs list)
+
+          if (( ${#missing_packages[@]} > 0 )); then
+            echo "::error title=Unpublished npm package(s)::Every release package must already exist on npm before this workflow runs."
+            printf '  - %s\n' "${missing_packages[@]}"
+            echo "Bootstrap each missing package through the approved npm first-publish process, then configure its GitHub Actions trusted publisher."
+            echo "Trusted publisher command: npm trust github <package> --repo cyrusagents/cyrus --file release-cli.yml --allow-publish --yes"
+            exit 1
+          fi
+
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile --strict-peer-dependencies
+
+      - name: Audit dependencies
+        run: pnpm audit --audit-level low
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Build all release packages
+        run: pnpm build
+
+      - name: Test packages and CLI
+        run: |
+          pnpm test:packages:run
+          pnpm --filter cyrus-ai test:run
+
+      - name: Type-check
+        run: pnpm typecheck
+
+      - name: Pack release artifacts in dependency order
+        shell: bash
+        run: |
+          mkdir -p "$RELEASE_ARTIFACTS"
+          while IFS=$'\t' read -r directory package_name; do
+            pnpm --dir "$directory" pack \
+              --out "$RELEASE_ARTIFACTS/%s-%v.tgz"
+          done < <(node scripts/release-packages.mjs list)
+
+      - name: Inspect package manifests
+        shell: bash
+        run: |
+          while IFS=$'\t' read -r directory package_name; do
+            tarball="$RELEASE_ARTIFACTS/${package_name}-${REQUESTED_VERSION}.tgz"
+            test -f "$tarball"
+            PACKAGE_NAME="$package_name" PACKAGE_TARBALL="$tarball" node <<'NODE'
+          const { execFileSync } = require("node:child_process");
+
+          const packed = JSON.parse(
+            execFileSync("tar", ["-xOf", process.env.PACKAGE_TARBALL, "package/package.json"], {
+              encoding: "utf8",
+            }),
+          );
+          if (packed.name !== process.env.PACKAGE_NAME || packed.version !== process.env.REQUESTED_VERSION) {
+            throw new Error(
+              `Packed ${packed.name}@${packed.version}; expected ${process.env.PACKAGE_NAME}@${process.env.REQUESTED_VERSION}.`,
+            );
+          }
+          for (const group of ["dependencies", "optionalDependencies", "peerDependencies"]) {
+            for (const [dependency, range] of Object.entries(packed[group] ?? {})) {
+              if (String(range).startsWith("workspace:")) {
+                throw new Error(`${packed.name} still contains ${dependency}: ${range}.`);
+              }
+            }
+          }
+          NODE
+          done < <(node scripts/release-packages.mjs list)
+
+      - name: Smoke-test the packed CLI
+        shell: bash
+        run: |
+          release_tarballs=()
+          while IFS=$'\t' read -r directory package_name; do
+            release_tarballs+=("$RELEASE_ARTIFACTS/${package_name}-${REQUESTED_VERSION}.tgz")
+          done < <(node scripts/release-packages.mjs list)
+          npm install --global "${release_tarballs[@]}"
+          ACTUAL_VERSION="$(CYRUS_SENTRY_DISABLED=1 cyrus --version)"
+          if [[ "$ACTUAL_VERSION" != "$REQUESTED_VERSION" ]]; then
+            echo "Packed CLI reports ${ACTUAL_VERSION}; expected ${REQUESTED_VERSION}." >&2
+            exit 1
+          fi
+
+      - name: Upload inspected release artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: cyrus-${{ inputs.version }}-packages
+          path: ${{ runner.temp }}/cyrus-release/*.tgz
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Install an OIDC-capable npm CLI
+        if: ${{ !inputs.dry_run }}
+        run: npm install --global npm@11.18.0
+
+      - name: Publish ordered artifacts and verify the complete registry graph
+        shell: bash
+        run: node scripts/publish-release.mjs
+
+      - name: Tag the release
+        if: ${{ !inputs.dry_run }}
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag --annotate "v${REQUESTED_VERSION}" --message "Release v${REQUESTED_VERSION}" "$GITHUB_SHA"
+          git push origin "v${REQUESTED_VERSION}"
+
+      - name: Create the GitHub release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          node scripts/release-packages.mjs notes "$REQUESTED_VERSION" > "$RUNNER_TEMP/release-notes.md"
+          gh release create "v${REQUESTED_VERSION}" \
+            --verify-tag \
+            --title "v${REQUESTED_VERSION}" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"
+
+      - name: Write release summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        shell: bash
+        run: |
+          if [[ "$JOB_STATUS" != "success" ]]; then
+            action="Failed before the release completed"
+          elif [[ "$DRY_RUN" == "true" ]]; then
+            action="Verified without publishing"
+          else
+            action="Published, tagged, and released"
+          fi
+          linear_issues="$(
+            node scripts/release-packages.mjs notes "$REQUESTED_VERSION" 2>/dev/null \
+              | grep -Eo 'CYPACK-[0-9]+' \
+              | sort -u \
+              | paste -sd ',' - \
+              | sed 's/,/, /g'
+          )" || linear_issues=""
+          package_count="$(
+            node scripts/release-packages.mjs list 2>/dev/null \
+              | wc -l \
+              | tr -d ' '
+          )" || package_count="unknown"
+          {
+            echo "## Cyrus CLI"
+            echo
+            echo "- **Result:** ${action}"
+            echo "- **Version:** \`${REQUESTED_VERSION}\`"
+            echo "- **npm tag:** \`${DIST_TAG}\`"
+            echo "- **Packages:** ${package_count} coordinated artifacts"
+            echo "- **Source:** \`${GITHUB_SHA}\` on \`${GITHUB_REF_NAME}\`"
+            if [[ -n "$linear_issues" ]]; then
+              echo "- **Post-release Linear transition:** ${linear_issues} → \`ReleasedMonitoring\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  test_build:
+    if: ${{ inputs.release_mode == 'test' }}
+    permissions:
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+      REQUESTED_VERSION: ${{ inputs.version }}
+      DIST_TAG: ${{ inputs.dist_tag }}
+      CYRUS_SENTRY_DISABLED: "1"
+    steps:
+      - name: Require reviewed workflow and immutable candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/main"
+          [[ "$DIST_TAG" =~ ^test(-[a-z0-9]+)*$ ]]
+          [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$REQUESTED_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*$ ]]
+
+      - name: Check out reviewed artifact tooling
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          path: tooling
+          persist-credentials: false
+
+      - name: Check out candidate from this repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24.18.0"
+          package-manager-cache: false
+
+      - name: Validate candidate with canonical release checks
+        shell: bash
+        run: |
+          node tooling/scripts/test-cli-artifacts.mjs validate candidate "$REQUESTED_VERSION" "$CANDIDATE_SHA"
+          echo "TEST_ARTIFACTS=$RUNNER_TEMP/cyrus-test-packages" >> "$GITHUB_ENV"
+          echo "TEST_BUNDLE=$RUNNER_TEMP/cyrus-test-bundle" >> "$GITHUB_ENV"
+
+      - name: Install the repository pnpm version
+        working-directory: candidate
+        shell: bash
+        run: |
+          PNPM_VERSION="$(node -p 'require("./package.json").packageManager.split("@")[1]')"
+          corepack enable
+          corepack prepare "pnpm@${PNPM_VERSION}" --activate
+
+      - name: Install locked dependencies
+        working-directory: candidate
+        run: pnpm install --frozen-lockfile --strict-peer-dependencies
+
+      - name: Audit dependencies
+        working-directory: candidate
+        run: pnpm audit --audit-level low
+
+      - name: Lint
+        working-directory: candidate
+        run: pnpm lint
+
+      - name: Build
+        working-directory: candidate
+        run: pnpm build
+
+      - name: Test packages and CLI
+        working-directory: candidate
+        run: |
+          pnpm test:packages:run
+          pnpm --filter cyrus-ai test:run
+
+      - name: Type-check
+        working-directory: candidate
+        run: pnpm typecheck
+
+      - name: Stamp immutable candidate provenance
+        run: |
+          node tooling/scripts/test-cli-artifacts.mjs validate candidate "$REQUESTED_VERSION" "$CANDIDATE_SHA"
+          node tooling/scripts/test-release.mjs stamp candidate
+
+      - name: Pack the complete canonical graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$TEST_ARTIFACTS"
+          node tooling/scripts/release-packages.mjs list > "$RUNNER_TEMP/release-packages.tsv"
+          while IFS=$'\t' read -r directory _package_name; do
+            pnpm --dir "candidate/$directory" pack --out "$TEST_ARTIFACTS/%s-%v.tgz"
+          done < "$RUNNER_TEMP/release-packages.tsv"
+
+      - name: Inspect and bundle all packages with SHA256 manifest
+        shell: bash
+        run: |
+          node tooling/scripts/test-cli-artifacts.mjs bundle "$REQUESTED_VERSION" "$CANDIDATE_SHA" "$GITHUB_SHA" "$TEST_ARTIFACTS" "$TEST_BUNDLE"
+
+      - name: Independently install and smoke-test the bundled CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bundle-smoke"
+          cd "$TEST_BUNDLE"
+          sha256sum --check SHA256SUMS
+          tar -xzf "cyrus-${REQUESTED_VERSION}-test-bundle.tar.gz" -C "$RUNNER_TEMP/bundle-smoke"
+          cd "$RUNNER_TEMP/bundle-smoke/cyrus-${REQUESTED_VERSION}-test-bundle"
+          sha256sum --check SHA256SUMS
+          # The installer checks version/help using its private test home.
+          bash install.sh "$RUNNER_TEMP/test-cli-prefix"
+
+      - name: Inspect immutable publication manifest
+        run: node tooling/scripts/test-release.mjs manifest "$TEST_ARTIFACTS"
+
+      # Never upload on a failed validation, test, package inspection, or install.
+      - name: Upload complete verified test bundle
+        id: upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: npm-test-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cyrus-test-packages/*
+          if-no-files-found: error
+          retention-days: 14
+
+
+  test_publish:
+    needs: test_build
+    if: ${{ inputs.release_mode == 'test' }}
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RELEASE_MODE: test
+      REQUESTED_VERSION: ${{ inputs.version }}
+      CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+      DIST_TAG: ${{ inputs.dist_tag }}
+      DRY_RUN: ${{ inputs.dry_run }}
+      NPM_CONFIG_IGNORE_SCRIPTS: "true"
+    steps:
+      - name: Require main publisher identity
+        run: test "$GITHUB_REF" = refs/heads/main
+      - name: Check out only reviewed publisher tooling
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: /scripts/
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24.18.0"
+          package-manager-cache: false
+      - name: Install pinned OIDC npm without lifecycle scripts
+        run: npm install --global npm@11.18.0 --ignore-scripts
+      - name: Download inspected packages from this build job
+        uses: actions/download-artifact@v7
+        with:
+          artifact-ids: ${{ needs.test_build.outputs.artifact_id }}
+          path: ${{ runner.temp }}/test-publication
+          merge-multiple: true
+      - name: Publish only inspected tarballs and verify registry contents and stable tags
+        shell: bash
+        run: |
+          export RELEASE_ARTIFACTS="$RUNNER_TEMP/test-publication"
+          node scripts/publish-release.mjs
+      - name: Preserve registry and unchanged-tag evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: npm-test-registry-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/test-publication/registry-proof.json
+          if-no-files-found: warn
+
+  test_install:
+    needs: test_publish
+    if: ${{ inputs.release_mode == 'test' && !inputs.dry_run }}
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - node: "22.17.1"
+            npm: "10.9.2"
+          - node: "24.18.0"
+            npm: "11.18.0"
+          - node: "24.18.0"
+            npm: "12.1.0"
+    env:
+      REQUESTED_VERSION: ${{ inputs.version }}
+      CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+      DIST_TAG: ${{ inputs.dist_tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: /scripts/
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          package-manager-cache: false
+      - name: Install supported npm version without hooks
+        env:
+          NPM_VERSION: ${{ matrix.npm }}
+        run: npm install --global "npm@$NPM_VERSION" --ignore-scripts
+      - name: Clean installation from the actual npm channel
+        run: node scripts/test-release-install.mjs
+      - name: Preserve clean-install evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: npm-test-install-${{ matrix.node }}-${{ matrix.npm }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/npm-channel-install/install-proof.json
+          if-no-files-found: error

@@ -19,6 +19,7 @@ export { AskUserQuestionHandler } from "./AskUserQuestionHandler.js";
 export type { ChatRepositoryProvider } from "./ChatRepositoryProvider.js";
 export { LiveChatRepositoryProvider } from "./ChatRepositoryProvider.js";
 export type {
+	ChatAccessDecision,
 	ChatPlatformAdapter,
 	ChatPlatformName,
 	ChatSessionHandlerDeps,
@@ -61,5 +62,5 @@ export {
 	DEFAULT_BLOCK_MESSAGE,
 	UserAccessControl,
 } from "./UserAccessControl.js";
-
 export { WorktreeIncludeService } from "./WorktreeIncludeService.js";
+export { ZulipChatAdapter } from "./ZulipChatAdapter.js";

@@ -19,6 +19,7 @@ describe("config", () => {
 				"Write(**)",
 				"Bash",
 				"Task",
+				"ListAgents",
 				"WebFetch",
 				"WebSearch",
 				"TaskCreate",
@@ -36,15 +37,15 @@ describe("config", () => {
 				"CronList",
 				"ScheduleWakeup",
 				"Monitor",
+				"LSP",
 				"RemoteTrigger",
-				"TaskOutput",
 				"TaskStop",
 				"ToolSearch",
 				"DesignSync",
 				"Workflow",
 				"ReportFindings",
 			]);
-			expect(availableTools).toHaveLength(29);
+			expect(availableTools).toHaveLength(30);
 		});
 
 		it("should define read-only tools", () => {
@@ -57,12 +58,13 @@ describe("config", () => {
 				"TaskGet",
 				"TaskList",
 				"Task",
+				"ListAgents",
 				"Skill",
 				"Monitor",
-				"TaskOutput",
+				"LSP",
 				"ToolSearch",
 			]);
-			expect(readOnlyTools).toHaveLength(12);
+			expect(readOnlyTools).toHaveLength(13);
 		});
 
 		it("should define write tools", () => {

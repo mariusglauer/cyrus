@@ -197,6 +197,8 @@ function buildSanitizedQueryOptions(
 	out.hasExtraArgs = !!o.extraArgs;
 	out.hasPathToClaudeCodeExecutable =
 		typeof o.pathToClaudeCodeExecutable === "string";
+	out.hasSpawnClaudeCodeProcess =
+		typeof o.spawnClaudeCodeProcess === "function";
 
 	return out;
 }
@@ -673,6 +675,10 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 					// particularly with CLAUDE.md files, settings files, and custom slash commands,
 					// see: https://docs.claude.com/en/docs/claude-code/sdk/migration-guide#settings-sources-no-longer-loaded-by-default
 					settingSources: ["user", "project", "local"],
+					// Preserve the pre-0.3.286 SDK permission policy: Cyrus tool rules
+					// and canUseTool handle approvals, regardless of permissions.defaultMode,
+					// provider, or telemetry. Omission now lets Claude Code select auto.
+					permissionMode: "default",
 					env: {
 						...buildBaseSessionEnv(),
 						...buildSessionTempEnv(this.config.sessionTempDir),
@@ -721,15 +727,10 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 					}),
 					...(Object.keys(mcpServers).length > 0 && { mcpServers }),
 					// Only use MCP servers we explicitly pass via `mcpConfig` /
-					// `mcpServers`. The flag is undertyped in the SDK's TS
-					// definition (described as "strict validation") but Claude
-					// Code's `--strict-mcp-config` CLI help is unambiguous:
-					// "Only use MCP servers from --mcp-config, ignoring all
-					// other MCP configurations." That's the contract we want
-					// for hosted sessions — never silently inherit servers
-					// from the user's `~/.claude.json`, project `.mcp.json`,
-					// or other ambient sources.
-					strictMcpConfig: true,
+					// `mcpServers` by default. Operators may opt out to let Claude
+					// Code also load project/user settings, plugins, and authenticated
+					// claude.ai connectors.
+					strictMcpConfig: this.config.strictMcpConfig ?? true,
 					hooks: this.buildHooksWithPendingWorkRecorder(),
 					...(this.config.plugins?.length && { plugins: this.config.plugins }),
 					...(this.config.skills !== undefined && {
@@ -743,6 +744,9 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 					...(this.config.sandbox && { sandbox: this.config.sandbox }),
 					...(this.config.extraArgs && { extraArgs: this.config.extraArgs }),
 					...(pathToClaudeCodeExecutable && { pathToClaudeCodeExecutable }),
+					...(this.config.spawnClaudeCodeProcess && {
+						spawnClaudeCodeProcess: this.config.spawnClaudeCodeProcess,
+					}),
 				},
 			};
 

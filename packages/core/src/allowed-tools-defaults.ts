@@ -38,6 +38,7 @@ export const LINEAR_DEFAULT_ALLOWED_TOOLS = [
 	// Execution
 	"Bash",
 	"Task",
+	"ListAgents",
 
 	// Web
 	"WebFetch",
@@ -56,7 +57,6 @@ export const LINEAR_DEFAULT_ALLOWED_TOOLS = [
 	"TaskUpdate",
 	"TaskGet",
 	"TaskList",
-	"TaskOutput",
 	"TaskStop",
 
 	// Scheduling
@@ -67,6 +67,7 @@ export const LINEAR_DEFAULT_ALLOWED_TOOLS = [
 
 	// Monitoring + discovery
 	"Monitor",
+	"LSP",
 	"RemoteTrigger",
 	"ToolSearch",
 	"Skill",
@@ -84,6 +85,7 @@ export const LINEAR_DEFAULT_ALLOWED_TOOLS = [
 	// sessions include `mcp__slack` so Cyrus can post status updates and
 	// follow-up messages to Slack while working on an issue.
 	"mcp__linear",
+	"mcp__plane",
 	"mcp__cyrus-tools",
 	"mcp__cyrus-docs",
 	"mcp__slack",
@@ -119,7 +121,6 @@ export const SLACK_DEFAULT_ALLOWED_TOOLS = [
 	"TaskUpdate",
 	"TaskGet",
 	"TaskList",
-	"TaskOutput",
 	"TaskStop",
 
 	// Discovery
@@ -156,6 +157,7 @@ export const GITHUB_DEFAULT_ALLOWED_TOOLS = [
 	// Execution
 	"Bash",
 	"Task",
+	"ListAgents",
 
 	// Web
 	"WebFetch",
@@ -174,7 +176,6 @@ export const GITHUB_DEFAULT_ALLOWED_TOOLS = [
 	"TaskUpdate",
 	"TaskGet",
 	"TaskList",
-	"TaskOutput",
 	"TaskStop",
 
 	// Scheduling
@@ -185,6 +186,7 @@ export const GITHUB_DEFAULT_ALLOWED_TOOLS = [
 
 	// Monitoring + discovery
 	"Monitor",
+	"LSP",
 	"RemoteTrigger",
 	"ToolSearch",
 	"Skill",
