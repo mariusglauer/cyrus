@@ -82,6 +82,50 @@ describe("EdgeWorker conflict rebase workspace preparation", () => {
 			"local change\n",
 		);
 	});
+
+	it("pushes a validated rebased head with an exact force-with-lease", () => {
+		testRoot = mkdtempSync(join(tmpdir(), "cyrus-conflict-push-"));
+		const remotePath = join(testRoot, "remote.git");
+		const repositoryPath = join(testRoot, "repository");
+
+		git(testRoot, ["init", "--bare", remotePath]);
+		git(testRoot, ["clone", remotePath, repositoryPath]);
+		configureGitUser(repositoryPath);
+		git(repositoryPath, ["checkout", "-b", "main"]);
+		writeFileSync(join(repositoryPath, "base.txt"), "base\n");
+		git(repositoryPath, ["add", "base.txt"]);
+		git(repositoryPath, ["commit", "-m", "base"]);
+		git(repositoryPath, ["push", "-u", "origin", "main"]);
+		git(repositoryPath, ["checkout", "-b", "feature/pr"]);
+		writeFileSync(join(repositoryPath, "feature.txt"), "feature\n");
+		git(repositoryPath, ["add", "feature.txt"]);
+		git(repositoryPath, ["commit", "-m", "feature"]);
+		git(repositoryPath, ["push", "-u", "origin", "feature/pr"]);
+		const previousHeadSha = git(repositoryPath, ["rev-parse", "HEAD"]).trim();
+		git(repositoryPath, ["checkout", "main"]);
+		writeFileSync(join(repositoryPath, "base.txt"), "updated base\n");
+		git(repositoryPath, ["commit", "-am", "update base"]);
+		git(repositoryPath, ["push", "origin", "main"]);
+		git(repositoryPath, ["checkout", "feature/pr"]);
+		git(repositoryPath, ["rebase", "origin/main"]);
+		const rebasedHeadSha = git(repositoryPath, ["rev-parse", "HEAD"]).trim();
+
+		const edgeWorker = Object.create(EdgeWorker.prototype) as EdgeWorker;
+		expect(
+			(edgeWorker as any).pushGitHubConflictRebaseResult(repositoryPath, {
+				head: { ref: "feature/pr", sha: previousHeadSha },
+				base: { ref: "main" },
+			}),
+		).toBe(rebasedHeadSha);
+		expect(
+			git(testRoot, [
+				"--git-dir",
+				remotePath,
+				"rev-parse",
+				"refs/heads/feature/pr",
+			]).trim(),
+		).toBe(rebasedHeadSha);
+	});
 });
 
 function git(cwd: string, args: string[]): string {

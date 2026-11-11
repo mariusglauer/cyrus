@@ -4180,6 +4180,81 @@ Your base branch \`${branchName}\` has received ${commitCount} new commit(s). Co
 		}
 	}
 
+	private pushGitHubConflictRebaseResult(
+		workspacePath: string,
+		pullRequest: GitHubPullRequest,
+	): string {
+		const branchRef = pullRequest.head.ref.trim();
+		const baseBranchRef = pullRequest.base.ref.trim();
+		const expectedRemoteHeadSha = pullRequest.head.sha.trim();
+		const commandOptions = {
+			cwd: workspacePath,
+			encoding: "utf8" as const,
+		};
+		const status = execFileSync(
+			"git",
+			["status", "--porcelain"],
+			commandOptions,
+		).trim();
+		if (status) {
+			throw new Error(
+				`Conflict rebase workspace ${workspacePath} is not clean after the agent finished`,
+			);
+		}
+
+		const currentBranch = execFileSync(
+			"git",
+			["branch", "--show-current"],
+			commandOptions,
+		).trim();
+		if (currentBranch !== branchRef) {
+			throw new Error(
+				`Conflict rebase workspace ${workspacePath} is on \`${currentBranch || "detached HEAD"}\`, expected \`${branchRef}\``,
+			);
+		}
+
+		const rebasedHeadSha = execFileSync(
+			"git",
+			["rev-parse", "HEAD"],
+			commandOptions,
+		).trim();
+		if (rebasedHeadSha === expectedRemoteHeadSha) {
+			throw new Error(
+				`Conflict rebase did not update the local head from ${expectedRemoteHeadSha}`,
+			);
+		}
+
+		try {
+			execFileSync(
+				"git",
+				["merge-base", "--is-ancestor", `origin/${baseBranchRef}`, "HEAD"],
+				commandOptions,
+			);
+		} catch {
+			throw new Error(
+				`Conflict rebase result ${rebasedHeadSha} does not contain origin/${baseBranchRef}`,
+			);
+		}
+
+		execFileSync(
+			"git",
+			[
+				"push",
+				"--no-verify",
+				`--force-with-lease=refs/heads/${branchRef}:${expectedRemoteHeadSha}`,
+				"origin",
+				`HEAD:refs/heads/${branchRef}`,
+			],
+			{
+				...commandOptions,
+				env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+				timeout: 120_000,
+			},
+		);
+
+		return rebasedHeadSha;
+	}
+
 	private assertGitHubConflictRebaseRunnerSucceeded(
 		runner: IAgentRunner,
 		workItemIdentifier: string,
@@ -4757,16 +4832,17 @@ ${taskSection}`;
 - **PR URL**: ${pullRequest.html_url}
 
 ## Task
-Rebase the PR branch \`${branchRef}\` onto \`origin/${baseBranchRef}\`, resolve merge conflicts, and push the rebased branch.
+Rebase the PR branch \`${branchRef}\` onto \`origin/${baseBranchRef}\` and resolve merge conflicts. Cyrus will push the validated result outside the agent sandbox after you finish.
 
 ## Instructions
 - You are already checked out on the PR branch \`${branchRef}\`
+- Work only in the current checkout; do not create another clone or worktree
 - Run \`git fetch origin\` before rebasing
 - Rebase with \`git rebase origin/${baseBranchRef}\`
 - Resolve only the conflicts caused by the rebase; keep the existing PR intent intact
 - Keep changes minimal and do not make unrelated product, formatting, or cleanup changes
 - Run focused checks that are relevant to touched files when practical
-- Push the rebased branch with \`git push --force-with-lease origin ${branchRef}\`
+- Do not push or run GitHub commands; leave the current branch clean at the rebased commit
 - If the rebase cannot be completed safely, run \`git rebase --abort\`, leave the working tree clean, and explain the blocker
 - Respond with a concise summary suitable for posting to the GitHub PR`;
 	}
@@ -9061,7 +9137,7 @@ ${taskSection}`;
 			event,
 			pullRequest,
 		);
-		const taskInstructions = `Rebase PR #${prNumber} branch \`${branchRef}\` onto \`origin/${baseBranchRef}\`, resolve merge conflicts only, and push the rebased branch with --force-with-lease.`;
+		const taskInstructions = `Rebase PR #${prNumber} branch \`${branchRef}\` onto \`origin/${baseBranchRef}\` and resolve merge conflicts only. Work in the current checkout, do not create another clone, and do not push; Cyrus will validate and push the result outside the agent sandbox.`;
 		const allowedTools =
 			this.toolPermissionResolver.buildGithubAllowedTools(repository);
 		const disallowedTools = this.buildDisallowedTools(repository);
@@ -9099,6 +9175,7 @@ ${taskSection}`;
 				runner,
 				`${repoFullName}#${prNumber}`,
 			);
+			this.pushGitHubConflictRebaseResult(workspace.path, pullRequest);
 			const verifiedPullRequest = await this.verifyGitHubConflictRebaseResult(
 				event,
 				pullRequest.head.sha,
